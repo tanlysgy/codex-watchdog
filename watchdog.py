@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """Codex Watchdog: auto-continue unfinished tasks.
 
-Registered as a global Stop hook. Every time a turn ends, Codex runs this
-script. If the task looks unfinished, we tell Codex to keep going
-(decision=block); when the task is done, waiting on the user, or the burst
-budget is exhausted, we let the turn finish normally (continue=true).
+Registered as a Stop hook (Codex) or ClaudeCodeStop (Claude Code). Every time
+a turn ends, the agent runs this script. If the task looks unfinished, we tell
+the agent to keep going (decision=block); when the task is done, waiting on
+the user, or the burst budget is exhausted, we let the turn finish normally.
 
-How "finished" is decided (improved, evidence-driven instead of pure
-keyword-guessing):
+Agent-agnostic via adapters/:
+  - adapters/codex.py  -> Codex JSONL transcripts (default)
+  - adapters/claude.py -> Claude Code transcripts
+  - adapters/<name>.py -> your own
 
-  1. Declared-protocol stop: if the assistant message begins with
-     "任务完成" / "需要用户" / "blocked", trust it exactly.
-  2. Tool-evidence: if the just-finished turn actually called tools
-     (exec_command / apply_patch / ...), the agent is still working, so
-     auto-continue regardless of how much the text "sounds like" a summary.
-  3. Quiet-turn counter: consecutive turns with NO tool activity are
-     recorded; after QUIET_TURNS_MAX (3) in a row (with no real user
-     prompt), stop - the agent is spinning/being chatty without progress.
-  4. Classic guards kept: burst budget, repeated identical final message,
-     short genuine need-user requests.
+Select with env CODEX_WATCHDOG_ADAPTER=claude (or codex).
+
+Evidence-driven finish detection:
+  1. Declared protocol: message starts with 任务完成/『任务完成』/done -> stop;
+     需要用户/『需要用户』/need user -> stop (blocked on user).
+  2. Burst budget: N auto-continues with no real user input -> stop.
+  3. Repeated identical final message -> stop (no progress).
+  4. Short genuine need-user request -> stop.
+  5. Tool evidence: current turn actually called tools -> continue.
+  6. Quiet turns: 3 tool-less turns in a row -> stop (spinning).
+  7. Classic done phrases (on a quiet turn) -> stop.
 
 State: /tmp/codex-watchdog/<session_id>.json
 Log:   /tmp/codex-watchdog.log
@@ -29,11 +32,25 @@ import re
 import sys
 import time
 
+# Make `adapters` importable whether run from the repo or from ~/.codex.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from adapters import load_adapter  # noqa: E402
+
 STATE_DIR = "/tmp/codex-watchdog"
 LOG_FILE = "/tmp/codex-watchdog.log"
 BURST_MAX = int(os.environ.get("CODEX_WATCHDOG_MAX", "60"))
 RESET_AFTER_SEC = float(os.environ.get("CODEX_WATCHDOG_RESET", "1800"))
 QUIET_TURNS_MAX = int(os.environ.get("CODEX_WATCHDOG_QUIET", "3"))
+ADAPTER_NAME = os.environ.get("CODEX_WATCHDOG_ADAPTER", "codex")
+
+try:
+    ADAPTER = load_adapter(ADAPTER_NAME)
+except Exception as exc:  # pragma: no cover - fallback so hooks never crash
+    sys.stderr.write(f"watchdog: failed to load adapter {ADAPTER_NAME!r}: {exc}\n")
+    ADAPTER = None
 
 # --- Explicit declarations the model is asked to make ---
 DECL_DONE = re.compile(
@@ -63,9 +80,7 @@ NEED_USER = re.compile(
     re.I,
 )
 
-RHETORICAL = re.compile(r"[吗么呢]+\s*[?？!！。]?\s*(不(需要|用|必)|无需|不必|我自己|我来|我可以|我会|算了)")
-
-NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions")
+RHETORICAL = re.compile(r"[吗么呢]+\s*[??!!。]?\s*(不(需要|用|必)|无需|不必|我自己|我来|我可以|我会|算了)")
 
 
 def log(msg: str) -> None:
@@ -99,119 +114,37 @@ def save_state(sid: str, state: dict) -> None:
 def session_activated(ev: dict, state: dict) -> bool:
     if os.environ.get("CODEX_WATCHDOG") == "0":
         return False
-    if state.get("activated"):
-        return True
     if os.environ.get("CODEX_WATCHDOG") == "1":
         return True
-    if os.path.exists(os.path.expanduser("~/.codex/watchdog.enabled")):
-        return True
+    marker = os.path.expanduser("~/.codex/watchdog.enabled")
+    # Marker next to the session cwd works for any agent.
     if os.path.exists(os.path.join(ev.get("cwd", ""), ".codex-watchdog")):
         return True
-    tp = ev.get("transcript_path")
-    if tp and os.path.exists(tp):
-        try:
-            with open(tp, encoding="utf-8", errors="replace") as f:
-                for line in list(f)[-200:]:
-                    try:
-                        o = json.loads(line)
-                    except ValueError:
-                        continue
-                    p = o.get("payload") or {}
-                    if o.get("type") != "response_item":
-                        continue
-                    if p.get("type") != "message" or p.get("role") != "user":
-                        continue
-                    text = "".join(
-                        c.get("text", "")
-                        for c in (p.get("content") or [])
-                        if isinstance(c, dict)
-                    ).lower()
-                    if "watchdog" in text or "看门狗" in text or "没做完自己继续" in text:
-                        return True
-        except OSError:
-            pass
+    if os.environ.get("CODEX_WATCHDOG_ADAPTER") in ("claude",):
+        marker = os.path.expanduser("~/.claude/watchdog.enabled")
+        if os.path.exists(marker):
+            return True
+    if ADAPTER is not None and ADAPTER.enabled(ev, state, marker):
+        return True
     return False
 
 
-def is_noise(text: str) -> bool:
-    t = text.strip()
-    if not t:
-        return True
-    return t.startswith(NOISE_PREFIXES)
+def last_user_prompt(ev: dict):
+    if ADAPTER is None:
+        return None
+    return ADAPTER.last_user_prompt(ev)
+
+
+def last_turn_tool_activity(ev: dict):
+    if ADAPTER is None:
+        return 0, set()
+    return ADAPTER.last_turn_tool_activity(ev)
 
 
 def is_watchdog_inject(text: str) -> bool:
-    t = text.strip()
-    return t.startswith("<hook_prompt") or "[watchdog]" in t
-
-
-def last_user_prompt(ev: dict) -> str | None:
-    tp = ev.get("transcript_path")
-    if not tp or not os.path.exists(tp):
-        return None
-    try:
-        with open(tp, encoding="utf-8", errors="replace") as f:
-            lines = list(f)[-600:]
-    except OSError:
-        return None
-    last = None
-    for line in lines:
-        try:
-            o = json.loads(line)
-        except ValueError:
-            continue
-        p = o.get("payload") or {}
-        if o.get("type") != "response_item":
-            continue
-        if p.get("type") != "message" or p.get("role") != "user":
-            continue
-        text = "".join(
-            c.get("text", "") for c in (p.get("content") or []) if isinstance(c, dict)
-        ).strip()
-        if not is_noise(text):
-            last = text
-    return last
-
-
-def last_turn_tool_activity(ev: dict) -> tuple[int, set[str]]:
-    """Count function_call entries in the most recent turn of the transcript.
-
-    Returns (count, names). A turn is bounded by the last task_started /
-    turn_context event before the tail of the file.
-    """
-    tp = ev.get("transcript_path")
-    if not tp or not os.path.exists(tp):
-        return 0, set()
-    try:
-        with open(tp, encoding="utf-8", errors="replace") as f:
-            lines = list(f)[-400:]
-    except OSError:
-        return 0, set()
-    turn_start = 0
-    for i, line in enumerate(lines):
-        try:
-            o = json.loads(line)
-        except ValueError:
-            continue
-        t = o.get("type")
-        if t == "turn_context":
-            turn_start = i
-        elif t == "event_msg" and (o.get("payload") or {}).get("type") == "task_started":
-            turn_start = i
-    n = 0
-    names: set[str] = set()
-    for line in lines[turn_start:]:
-        try:
-            o = json.loads(line)
-        except ValueError:
-            continue
-        p = o.get("payload") or {}
-        if o.get("type") == "response_item" and p.get("type") == "function_call":
-            n += 1
-            nm = p.get("name") or ""
-            if nm:
-                names.add(nm)
-    return n, names
+    if ADAPTER is None:
+        return "[watchdog]" in (text or "")
+    return ADAPTER.is_watchdog_inject(text)
 
 
 def should_reset_burst(state: dict, ev: dict) -> bool:
@@ -233,7 +166,9 @@ def main() -> None:
         ev = json.load(sys.stdin)
     except ValueError:
         return
-    if ev.get("hook_event_name") != "Stop":
+    hook_event = ev.get("hook_event_name") or ev.get("hookEventName") or ""
+    # Accept both Codex ("Stop") and Claude Code ("Stop") event names.
+    if hook_event not in ("Stop", "ClaudeCodeStop"):
         return
 
     sid = ev.get("session_id") or "unknown"
@@ -284,19 +219,18 @@ def main() -> None:
     # ---- 5. tool evidence for the just-finished turn ----
     fc_count, fc_names = last_turn_tool_activity(ev)
     if fc_count <= 0:
-        # No tools were called in this turn -> a "quiet" turn.
         state["quiet_turns"] = state.get("quiet_turns", 0) + 1
     else:
         state["quiet_turns"] = 0
 
-    # ---- 6. fallback DONE (only stop if this was a quiet turn, i.e. no tool ran) ----
+    # ---- 6. fallback DONE (only stop if this was a quiet turn) ----
     if state.get("quiet_turns", 0) >= 1 and DONE.search(msg):
         log(f"{sid} done (quiet turn + done phrase): {msg[:80]!r}; stopping")
         save_state(sid, state)
         print(json.dumps({"continue": True}))
         return
 
-    # ---- 7. too many quiet turns in a row -> stop (spinning without progress) ----
+    # ---- 7. too many quiet turns in a row -> stop (spinning) ----
     if state.get("quiet_turns", 0) >= QUIET_TURNS_MAX:
         log(f"{sid} {QUIET_TURNS_MAX} quiet turns in a row (no tool activity); stopping")
         save_state(sid, state)

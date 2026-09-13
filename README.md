@@ -121,15 +121,22 @@ Log tail meanings:
 
 ### Cross‑agent compatibility
 
-**Yes — this works with any CLI agent that supports Stop hooks.**  
-Tested with Codex. Designed to be agent-agnostic:
+**Yes — works with Codex and Claude Code out of the box.**  
+The engine is agent-agnostic: transcript parsing lives in `adapters/` and is
+selected via `CODEX_WATCHDOG_ADAPTER`:
 
-- **Claude Code**: supports `ClaudeCodeStop` in its [hooks system](https://docs.anthropic.com/en/docs/claude-code/hooks). Adapt the event name and config path — same `watchdog.py` logic.
+| Agent | Adapter | Install |
+|---|---|---|
+| Codex | `adapters/codex.py` (default) | `bash install.sh` |
+| Claude Code | `adapters/claude.py` | `bash install.sh --agent claude` |
+
+- **Codex**: registered as a `[[hooks.Stop]]` in `~/.codex/config.toml`.
+- **Claude Code**: registered as a `Stop` command hook in `~/.claude/settings.json` (see [docs/CLAUDE.md](docs/CLAUDE.md)). Claude's Stop hook shares the same JSON contract: `decision:"block"` + `reason` keeps it working.
 - **Gemini CLI**: `PreToolUse` / `PostToolUse` hooks available; a Stop-equivalent event is in preview.
 - **Cursor / Continue.dev (Sidecar)**: do not expose lifecycle hooks — incompatible without additional tooling.
 
 The core logic (`watchdog.py`) is pure Python, zero dependencies, and reads/produces JSON on
-stdin/stdout — any shell with `python3` can run it.
+stdin/stdout — any agent with a Stop hook and a small adapter can reuse it.
 
 ---
 

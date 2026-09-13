@@ -21,3 +21,5 @@ jobs:
         run: python -m py_compile watchdog.py watchdog_test.py
       - name: Run regression tests
         run: python watchdog_test.py
+      - name: Run adapter tests
+        run: python adapters_test.py
