@@ -159,6 +159,7 @@ def main():
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
+        os.makedirs(os.path.dirname(ENABLED), exist_ok=True)
         open(ENABLED, "a").close()
         print("(restored watchdog.enabled)")
     sys.exit(1 if FAIL else 0)
