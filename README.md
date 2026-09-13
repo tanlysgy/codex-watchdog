@@ -1,28 +1,42 @@
+<div align="center">
+
 # Codex Watchdog
 
-让 Codex 在任务未完成时自动继续(`continue`),而不是停在半路等你手动推。
+**让 Codex 在任务未完成时自动继续 — Auto-continue Codex when tasks aren't done yet**
 
-> 背景:Codex 偶尔会在任务没做完时就结束回合(尤其上下文压缩后),需要你反复输入 `continue`。
-> 本项目在 **Stop hook** 的机制上做一个"看门狗":每回合结束自动检查,没干完就自动续推,干完了/卡住了/在打转就停。
+[![CI](https://github.com/tanlysgy/codex-watchdog/actions/workflows/ci.yml/badge.svg)](https://github.com/tanlysgy/codex-watchdog/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)]()
+[![GitHub stars](https://img.shields.io/github/stars/tanlysgy/codex-watchdog?style=social)](https://github.com/tanlysgy/codex-watchdog)
 
-## 它怎么判断"干完没"
+</div>
 
-不是猜一句话,而是证据驱动:
+> Codex often wraps up a turn with a progress summary before the task is truly finished,
+> forcing you to type `continue` over and over. This project plugs a **Stop hook** into Codex
+> that checks whether work is really done — if not, it auto-continues until the task is complete.
+
+---
+
+## 中文版 (Chinese)
+
+让 Codex 在任务未完成时自动继续,而不是停在半路等你手动推。
+
+### 原理 (How it works)
+
+Codex 每回合结束会触发 `Stop` hook → 运行 `watchdog.py` → 脚本基于以下信号决定继续或停止:
 
 | 信号 | 行为 |
 |---|---|
-| 本回合真实调用了工具(`exec_command`/`apply_patch`...) | **继续推**(还在干活) |
-| 模型明确说 `『任务完成』` / `任务完成` | **停** |
-| 模型明确说 `『需要用户』` / `需要用户:` | **停**(等你提供信息/凭据) |
-| 连续 3 个回合没调用任何工具 | **停**(在原地打转) |
-| 同一句最终消息重复出现 | **停**(无进展) |
-| 消息是明确的短请求("请你提供 API key") | **停**(真在等你) |
-| 连续 60 次自动续推、期间无真实用户输入 | **停**(兜底防失控) |
-| 空闲超过 30 分钟 | 重置续推预算 |
+| 本回合调用了工具(`exec_command`/`apply_patch`...) | 继续(还在干活) |
+| 模型声明 `『任务完成』` / `任务完成` | 停 |
+| 模型声明 `『需要用户』` / `需要用户:` | 停(等你输入) |
+| 连续 3 回合无工具调用 | 停(原地打转) |
+| 同一句最终消息重复 | 停(无进展) |
+| 短请求("请你提供 API key") | 停(真在等你) |
+| 连续 60 次自动续推、无用户输入 | 停(兜底) |
+| 空闲超过 30 分钟 | 重置预算 |
 
-## 安装
-
-### 方式一:一键脚本(Linux/macOS)
+### 安装
 
 ```bash
 git clone https://github.com/tanlysgy/codex-watchdog
@@ -30,78 +44,95 @@ cd codex-watchdog
 bash install.sh
 ```
 
-`install.sh` 会:
-1. 复制 `watchdog.py` → `~/.codex/`
-2. 注册 `[[hooks.Stop]]` 到 `~/.codex/config.toml`
-3. 创建 `~/.codex/watchdog.enabled` 启用标记
+然后在 Codex CLI 里运行 `/hooks`,给 `watchdog.py` 这条点"信任"。
 
-### 方式二:手动
-
-把 `watchdog.py` 放到 `~/.codex/`,在 `~/.codex/config.toml` 加:
-
-```toml
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "python3 ~/.codex/watchdog.py"
-timeout = 30
-```
-
-然后 `touch ~/.codex/watchdog.enabled`
-
-### 信任 hook(必做)
-
-Codex 对非托管 hook 有信任机制,未信任会被**静默跳过**。在 Codex CLI/TUI 里运行:
-
-```
-/hooks
-```
-
-找到 `watchdog.py` 那条,给它信任。
-
-## 验证
-
-跑一个简单任务,然后:
+### 验证
 
 ```bash
-tail /tmp/codex-watchdog.log
+python3 watchdog_test.py    # 回归测试(11 项)
+tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 ```
 
-看到 `continue #1` 就说明生效了。
+---
 
-回归测试:
+## English
+
+Auto-continue your Codex CLI when a turn ends before the task is complete — no more
+repeatedly typing `continue`.
+
+### How it works
+
+A Codex **Stop hook** runs after every turn. `watchdog.py` reads the situation and decides:
+
+| Signal | Action |
+|---|---|
+| Turn actually called tools (`exec_command` / `apply_patch` ...) | **Continue** (agent is working) |
+| Agent declares `『任务完成』` / `『Task Complete』` / `任务完成` | **Stop** |
+| Agent declares `『需要用户』` / `『Need User』` | **Stop** (blocked on you) |
+| No tool calls for 3 consecutive turns | **Stop** (spinning) |
+| Same final message repeated verbatim | **Stop** (no progress) |
+| Short need-user sentence ("please provide the API key") | **Stop** |
+| 60 auto-continues in a row with no real user input | **Stop** (burst guard) |
+| Idle > 30 minutes | Reset burst budget |
+
+### Install
 
 ```bash
-python3 watchdog_test.py
+git clone https://github.com/tanlysgy/codex-watchdog
+cd codex-watchdog
+bash install.sh
 ```
 
-## 配置(环境变量)
+Then run `/hooks` inside Codex CLI and **trust** the `watchdog.py` hook entry.
 
-| 变量 | 默认 | 含义 |
-|---|---|---|
-| `CODEX_WATCHDOG_MAX` | `60` | 单次突发自动续推上限 |
-| `CODEX_WATCHDOG_RESET` | `1800` | 空闲多少秒后重置预算 |
-| `CODEX_WATCHDOG_QUIET` | `3` | 连续多少回合无工具调用则判定打转 |
+### Verify
 
-## 状态与日志
+```bash
+python3 watchdog_test.py    # 11 regression tests
+tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
+```
 
-- 状态:`/tmp/codex-watchdog/<session_id>.json`
-- 日志:`/tmp/codex-watchdog.log`
-
-末尾几行含义:
-- `declared done` / `done` — 模型声明/确认真完成,正常停
-- `needs user` / `declared need-user` — 在等你输入,正常停
-- `repeated final message` — 原地重复,正常停
-- `N quiet turns in a row` — 连续没动手,正常停
-- `burst exhausted` — 连续 60 次无输入,兜底停
-
-## 卸载
+### Uninstall
 
 ```bash
 rm ~/.codex/watchdog.py ~/.codex/watchdog.enabled
-# 并从 ~/.codex/config.toml 移除 [[hooks.Stop]] 那几行
+# remove the [[hooks.Stop]] block from ~/.codex/config.toml
 ```
 
-## License
+### Configuration (env vars)
 
-MIT
+| Variable | Default | Meaning |
+|---|---|---|
+| `CODEX_WATCHDOG_MAX` | `60` | Burst auto-continue limit |
+| `CODEX_WATCHDOG_RESET` | `1800` | Idle seconds before budget reset |
+| `CODEX_WATCHDOG_QUIET` | `3` | Consecutive tool-less turns before spinning detection |
+
+### State & Logs
+
+- State: `/tmp/codex-watchdog/<session_id>.json`
+- Log: `/tmp/codex-watchdog.log`
+
+Log tail meanings:
+- `declared done` / `done` — task genuinely finished
+- `needs user` / `declared need-user` — blocked on you
+- `repeated final message` — spinning in place
+- `N quiet turns in a row` — no tools called for N turns
+- `burst exhausted` — 60 auto-continues, no user nudged
+
+### Cross‑agent compatibility
+
+**Yes — this works with any CLI agent that supports Stop hooks.**  
+Tested with Codex. Designed to be agent-agnostic:
+
+- **Claude Code**: supports `ClaudeCodeStop` in its [hooks system](https://docs.anthropic.com/en/docs/claude-code/hooks). Adapt the event name and config path — same `watchdog.py` logic.
+- **Gemini CLI**: `PreToolUse` / `PostToolUse` hooks available; a Stop-equivalent event is in preview.
+- **Cursor / Continue.dev (Sidecar)**: do not expose lifecycle hooks — incompatible without additional tooling.
+
+The core logic (`watchdog.py`) is pure Python, zero dependencies, and reads/produces JSON on
+stdin/stdout — any shell with `python3` can run it.
+
+---
+
+### License
+
+MIT &mdash; feel free to fork, adapt, and share.
