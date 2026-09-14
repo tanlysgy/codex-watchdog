@@ -31,7 +31,7 @@ if [ -n "${UNINSTALL:-}" ]; then
   echo "==> 卸载:删除 $DEST/watchdog.* 与 adapters/ =="
   rm -f "$DEST/watchdog.py" "$DEST/watchdog_test.py" "$DEST/watchdog.enabled"
   rm -rf "$DEST/adapters"
-  echo "  已删除。请手动从 $DEST/config.toml 移除 [[hooks.Stop]] 块(或 settings.json 的 Stop hook)。"
+  echo "  已删除。请手动从 $DEST/hooks.json(Codex)或 $DEST/settings.json(Claude)移除 watchdog 条目。"
   exit 0
 fi
 
@@ -80,28 +80,44 @@ PY
   touch "$DEST/watchdog.enabled"
   echo "  OK"
 else
-  echo "==> 4/5 注册 Codex Stop hook → $DEST/config.toml =="
-  CFG="$DEST/config.toml"
-  if grep -q 'watchdog' "$CFG" 2>/dev/null; then
+  echo "==> 4/5 注册 Codex Stop hook → $DEST/hooks.json =="
+  HOOKS="$DEST/hooks.json"
+  if grep -q 'watchdog' "$HOOKS" 2>/dev/null; then
     echo "  (已存在,跳过)"
   else
-    cat >> "$CFG" <<'EOF'
-
-# Codex Watchdog: auto-continue unfinished tasks (see ~/.codex/watchdog.py)
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "python3 ~/.codex/watchdog.py"
-timeout = 30
-EOF
+    python3 - "$HOOKS" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+data = {}
+if os.path.exists(p):
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except ValueError:
+        data = {}
+hooks = data.setdefault("hooks", {})
+entry = {
+    "matcher": "",
+    "hooks": [
+        {
+            "type": "command",
+            "command": "python3 ~/.codex/watchdog.py",
+            "timeout": 30,
+        }
+    ],
+}
+hooks.setdefault("Stop", []).append(entry)
+with open(p, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
     echo "  OK"
   fi
-  echo "==> 5/5 创建启用标记"
+  echo "==> 5/5 创建启用标记 (watchdog.enabled)"
   touch "$DEST/watchdog.enabled"
   echo "  OK"
 fi
 
-echo ""
 echo "==== 安装完成($AGENT)===="
 echo "下一步:在 Codex 里运行 /hooks 并信任 watchdog.py;"
 echo "      在 Claude Code 里首次触发 Stop hook 时选 Trust & run。"
