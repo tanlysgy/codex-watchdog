@@ -98,6 +98,21 @@ transcript parsing lives in `adapters/` and is selected via `CODEX_WATCHDOG_ADAP
 The core logic (`watchdog.py`) is pure Python, zero dependencies, and reads/produces JSON on
 stdin/stdout — any agent with a Stop hook and a small adapter can reuse it.
 
+### Comparison & known limitations
+
+Similar projects we found while evaluating this one:
+
+| Project | Approach | Difference from us |
+|---|---|---|
+| [flowing-water1/codex-watchdog](https://github.com/flowing-water1/codex-watchdog) | Node.js proxy between the Codex TUI and `app-server` | Watches **outside** the Stop hook; recovers transient failures (429/502/503/504), context exhaustion, and usage limits — deeper than a hook can reach |
+| [kur114/codex-auto-continue-hook](https://github.com/kur114/codex-auto-continue-hook) | Stop hook + keyword matching | Same hook-based idea, but keyword matching is brittle; we use evidence-driven detection (tool activity, `任务完成`/`需要用户` protocol, quiet-turn + burst guards) |
+
+**Known limitation**: we run inside the Stop hook, so we can only act when a turn
+actually ends and triggers the hook. If a connection drops mid-response and the
+turn never completes cleanly (no `Stop` event), the watchdog cannot restart it —
+that class of failure needs an out-of-process supervisor like
+`flowing-water1/codex-watchdog`.
+
 ### License
 
 MIT &mdash; feel free to fork, adapt, and share.

@@ -89,6 +89,19 @@ bash install.sh --uninstall
 # 或手动移除 ~/.codex/hooks.json 里的 watchdog 条目与 ~/.codex/watchdog.*
 ```
 
+### 同类项目对比与已知局限
+
+调研时找到的两个最像的项目:
+
+| 项目 | 方案 | 与我们差异 |
+|---|---|---|
+| [flowing-water1/codex-watchdog](https://github.com/flowing-water1/codex-watchdog) | Node.js 代理,插在 Codex TUI 与 `app-server` 之间 | 在 Stop hook **之外**主动监控,能恢复瞬时故障(429/502/503/504)、上下文耗尽、额度限制——比 hook 能触及的更深 |
+| [kur114/codex-auto-continue-hook](https://github.com/kur114/codex-auto-continue-hook) | Stop hook + 关键词匹配 | 思路相同,但关键词硬匹配脆弱;我们用证据驱动(工具调用 + `任务完成`/`需要用户` 协议 + 静默/预算兜底)更抗误判 |
+
+**已知局限**:我们运行在 Stop hook 内部,只能在一回合正常结束并触发 hook 时介入。
+如果连接中断但回合没有正常收尾(没有触发 Stop 事件),看门狗无法自己重启它——这类
+故障需要进程外的监督器(如 `flowing-water1/codex-watchdog` 的方案)。
+
 ### License
 
 MIT
