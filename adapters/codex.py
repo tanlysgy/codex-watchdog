@@ -88,7 +88,7 @@ class CodexAdapter(BaseAdapter):
     def enabled(self, ev: dict, state: dict, marker: str) -> bool:
         if state.get("activated"):
             return True
-        rows = self._rows(ev.get("transcript_path"), 200)
+        rows = self._rows(ev.get("transcript_path"), 600)
         for o in rows:
             text = self._user_text(o).lower()
             if "watchdog" in text or "看门狗" in text or "没做完自己继续" in text:

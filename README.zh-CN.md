@@ -46,7 +46,13 @@ cd codex-watchdog
 bash install.sh
 ```
 
-然后在 Codex CLI 里运行 `/hooks`,给 `watchdog.py` 这条点"信任"。
+脚本会注册 `~/.codex/hooks.json` 的 `Stop` hook,并创建全局启用标记
+`~/.codex/watchdog.enabled`(所有会话都启用)。然后在 Codex CLI 里运行
+`/hooks`,给 `watchdog.py` 这条点"信任"。
+
+> 升级已有安装?重跑 `bash install.sh` 即可——启用标记会对**所有**会话生效,
+> 包括老会话,不再需要会话里出现"看门狗"等唤醒词(转录唤醒词扫描仍保留,
+> 作为无标记会话的兜底)。
 
 ### 验证
 

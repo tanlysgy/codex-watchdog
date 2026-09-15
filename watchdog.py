@@ -116,7 +116,13 @@ def session_activated(ev: dict, state: dict) -> bool:
         return False
     if os.environ.get("CODEX_WATCHDOG") == "1":
         return True
+    # Global marker (~/.codex/watchdog.enabled) == watchdog installed & enabled
+    # for every session. Created by install.sh; checked first so upgrades of an
+    # already-enabled install keep working even when the transcript carries no
+    # wake word (the wake-word fallback below is per-session convenience).
     marker = os.path.expanduser("~/.codex/watchdog.enabled")
+    if os.path.exists(marker):
+        return True
     # Marker next to the session cwd works for any agent.
     if os.path.exists(os.path.join(ev.get("cwd", ""), ".codex-watchdog")):
         return True

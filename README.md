@@ -39,7 +39,14 @@ cd codex-watchdog
 bash install.sh
 ```
 
-Then run `/hooks` inside Codex CLI and **trust** the `watchdog.py` hook entry.
+That registers a `Stop` hook in `~/.codex/hooks.json` and creates the global
+enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
+`/hooks` inside Codex CLI and **trust** the `watchdog.py` hook entry.
+
+> Upgrading an existing install? Re-run `bash install.sh` — the enable marker
+> makes the watchdog active for every session, old ones included, so there is
+> no need for a per-session "wake word" anymore (the transcript wake-word scan
+> remains as a fallback for sessions started without the marker).
 
 ### Verify
 

@@ -157,6 +157,28 @@ def main():
     r = run_main([env, aborted, inj, turn_start()], "继续干活,还没完", sid="s11")
     check("noise+inject only -> block", r.get("decision"), "block")
 
+    # ---- global enabled marker activates sessions even without wake words ----
+    had_marker = os.path.exists(ENABLED)
+    if not had_marker:
+        os.makedirs(os.path.dirname(ENABLED), exist_ok=True)
+        open(ENABLED, "a").close()
+    r = run_main([turn_start(), tool_call("apply_patch")], "继续 P8 收尾", sid="s12",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": False})
+    check("global marker activates watchdog (no wake word) -> block", r.get("decision"), "block")
+
+    # ---- without marker and without wake word -> watchdog stays silent ----
+    backup = None
+    if had_marker:
+        backup = ENABLED + ".bak"
+        os.replace(ENABLED, backup)
+    r = run_main([turn_start(), tool_call()], "继续干活,还没完", sid="s13",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": False})
+    check("no marker + no wake word -> silent skip", r, {})
+    if backup is not None:
+        os.replace(backup, ENABLED)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
         os.makedirs(os.path.dirname(ENABLED), exist_ok=True)

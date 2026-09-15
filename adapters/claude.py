@@ -148,7 +148,7 @@ class ClaudeAdapter(BaseAdapter):
         # marker-file convention as Codex if present.
         if os.path.exists(marker):
             return True
-        rows = self._rows(ev.get("transcript_path"), 200)
+        rows = self._rows(ev.get("transcript_path"), 600)
         for o in rows:
             text = self._entry_text(o).lower()
             if "watchdog" in text or "看门狗" in text:
