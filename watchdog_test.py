@@ -169,7 +169,7 @@ def main():
 
     # ---- without marker and without wake word -> watchdog stays silent ----
     backup = None
-    if had_marker:
+    if os.path.exists(ENABLED):
         backup = ENABLED + ".bak"
         os.replace(ENABLED, backup)
     r = run_main([turn_start(), tool_call()], "继续干活,还没完", sid="s13",
