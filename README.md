@@ -20,6 +20,11 @@ repeatedly typing `continue`.
 
 A Codex **Stop hook** runs after every turn. `watchdog.py` reads the situation and decides:
 
+> Protocol for the watched agent: when a turn really is finished, say `任务完成`
+> (or `Task Complete`); when you need the user — input, a choice, credentials, or
+> approval for an optional step — say `需要用户` (or `Need User`) and stop. The
+> watchdog observes these declarations and respects them immediately.
+
 | Signal | Action |
 |---|---|
 | Turn actually called tools (`exec_command` / `apply_patch` ...) | **Continue** (agent is working) |
@@ -28,6 +33,7 @@ A Codex **Stop hook** runs after every turn. `watchdog.py` reads the situation a
 | No tool calls for 3 consecutive turns | **Stop** (spinning) |
 | Same final message repeated verbatim | **Stop** (no progress) |
 | Short need-user sentence ("please provide the API key") | **Stop** |
+| Agent offers optional follow-ups or asks a question ("Want me to...?") | **Stop** (wait for you) |
 | 60 auto-continues in a row with no real user input | **Stop** (burst guard) |
 | Idle > 30 minutes | Reset burst budget |
 

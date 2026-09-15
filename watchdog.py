@@ -82,6 +82,23 @@ NEED_USER = re.compile(
 
 RHETORICAL = re.compile(r"[吗么呢]+\s*[??!!。]?\s*(不(需要|用|必)|无需|不必|我自己|我来|我可以|我会|算了)")
 
+# Conversation patterns where the agent is handing control back to the user
+# (offering options, asking a question, or asking for a decision). When a
+# turn ends on one of these, we must STOP and wait — auto-continuing past a
+# genuine question is annoying and can even modify the repo without consent.
+PROMPT_FOR_INPUT = re.compile(
+    r"(要不要|需不需要|是否(需要|要)|你(想|觉得|希望|要不要)(怎么|如何|用|选|做)?|"
+    r"你(来)?(选|决定|拍板|拿主意|确认一下?|说了算)|"
+    r"等(你|您|您来|你来)(选|决定|确认|拍板|拿主意|输入|回复|答复|告诉|选择|指示|消息)|"
+    r"请(你|您)?(选|决定|确认|拍板|输入|回复|答复|告诉|选择|指示|告知|提供)|"
+    r"(\?|？|吗|呢)$|"
+    r"which (option|one|approach)|what do you (want|prefer|think)|"
+    r"(do|would) you (want|like|prefer)|your (call|choice|decision)|"
+    r"(waiting|wait) for (your|you) (input|decision|choice|answer|confirmation)|"
+    r"let me know (if|what|how|whether)|tell me (if|what|how|whether))",
+    re.I,
+)
+
 
 def log(msg: str) -> None:
     try:
@@ -222,6 +239,13 @@ def main() -> None:
         print(json.dumps({"continue": True}))
         return
 
+    # ---- 4b. agent offered options / asked for a decision -> stop & wait ----
+    if len(msg) <= 400 and PROMPT_FOR_INPUT.search(msg):
+        log(f"{sid} prompt-for-input: {msg[:80]!r}; stopping")
+        save_state(sid, state)
+        print(json.dumps({"continue": True}))
+        return
+
     # ---- 5. tool evidence for the just-finished turn ----
     fc_count, fc_names = last_turn_tool_activity(ev)
     if fc_count <= 0:
@@ -251,7 +275,8 @@ def main() -> None:
     reason = (
         "[watchdog] 任务尚未完成,请继续执行刚才的任务,不要输出阶段总结就停下。"
         "如果任务已经真正全部完成,请直接说『任务完成』并结束;"
-        "如果遇到必须由用户提供信息、选择或凭据才能继续的情况,请直接说『需要用户』并停下列出问题。"
+        "如果必须由用户提供信息、选择或凭据,或你想请用户做主/抛可选后续,请直接说『需要用户』并停下列出问题或选项,"
+        "不要继续行动,也不要自己动手做可选事项;"
         "否则请继续执行,不要输出阶段总结就停下。"
     )
     log(f"{sid} continue #{state['count']} (tools={fc_count}): {msg[:60]!r}")

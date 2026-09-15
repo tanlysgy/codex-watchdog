@@ -185,6 +185,12 @@ def main():
                        "quiet_turns": 0, "activated": True})
     check("connection lost -> block (auto-continue)", r.get("decision"), "block")
 
+    # ---- agent offered optional follow-up / asked for decision -> stop ----
+    r = run_main([turn_start(), tool_call()], "要不要我把对比写进 README?", sid="s15",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True})
+    check("agent offers optional next step -> continue(stop)", r.get("continue"), True)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
         os.makedirs(os.path.dirname(ENABLED), exist_ok=True)
