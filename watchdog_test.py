@@ -179,6 +179,12 @@ def main():
     if backup is not None:
         os.replace(backup, ENABLED)
 
+    # ---- connection lost mid-response -> auto-continue ----
+    r = run_main([turn_start()], "API Error: Connection lost mid-response. The response above may be incomplete.", sid="s14",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True})
+    check("connection lost -> block (auto-continue)", r.get("decision"), "block")
+
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
         os.makedirs(os.path.dirname(ENABLED), exist_ok=True)
