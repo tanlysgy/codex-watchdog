@@ -93,13 +93,33 @@ check("claude: tool names", names, {"Bash", "Edit"})
 check("claude: inject", claude.is_watchdog_inject("[watchdog] 继续"), True)
 check("claude: not inject", claude.is_watchdog_inject("正常消息"), False)
 
+# 7b. claude: nested tool_use inside assistant content (real transcript shape)
+p_aux = write_tmp([
+    claude_user("继续做"),
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "查一下"},
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+        {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "a.py"}},
+    ]}},
+])
+n, names = claude.last_turn_tool_activity({"transcript_path": p_aux})
+check("claude: nested tool_use count", n, 2)
+check("claude: nested tool_use names", names, {"Bash", "Read"})
+
+# 7c. claude: Stop hook feedback is noise (our own injection)
+p_fb = write_tmp([
+    {"type": "user", "message": {"role": "user", "content": "Reply with exactly: watchdog-e2e-ok"}},
+    {"type": "user", "message": {"role": "user", "content": "Stop hook feedback:\n[watchdog] The task is not finished; keep working..."}},
+])
+check("claude: stop hook feedback is noise", claude.last_user_prompt({"transcript_path": p_fb}), "Reply with exactly: watchdog-e2e-ok")
+
 # 8. claude: JSON array transcript
 p6 = tempfile.mktemp(suffix=".json")
 with open(p6, "w") as f:
     json.dump([claude_user("数组格式"), claude_tool_use("Bash")], f)
 check("claude: array transcript user", claude.last_user_prompt({"transcript_path": p6}), "数组格式")
 
-for p in (p1, p2, p3, p4, p5, p6):
+for p in (p1, p2, p3, p4, p5, p6, p_aux, p_fb):
     try:
         os.remove(p)
     except OSError:

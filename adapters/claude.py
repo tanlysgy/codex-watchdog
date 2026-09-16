@@ -21,7 +21,42 @@ import json
 import os
 from .base import BaseAdapter
 
-NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions")
+NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions", "Stop hook feedback:")
+
+
+def _content_tool_uses(content):
+    """Count tool_use blocks nested in a Claude content list.
+
+    Real Claude Code transcripts nest tool calls inside assistant
+    message content blocks ({"type":"tool_use","name":...}) rather than
+    emitting standalone tool_use rows; the Stop hook payload also
+    sometimes carries them there. Count any nested tool_use blocks so
+    tool activity isn't misread as a quiet turn.
+    """
+    if isinstance(content, str):
+        return 0, set()
+    if isinstance(content, dict):
+        b = content.get("type") == "tool_use"
+        if b:
+            nm = content.get("name") or ""
+            return 1, {nm} if nm else set()
+        return 0, set()
+    if isinstance(content, list):
+        n = 0
+        names = set()
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") == "tool_use":
+                    n += 1
+                    nm = c.get("name") or ""
+                    if nm:
+                        names.add(nm)
+                else:
+                    sub_n, sub_names = _content_tool_uses(c)
+                    n += sub_n
+                    names |= sub_names
+        return n, names
+    return 0, set()
 
 
 def _content_to_text(content) -> str:
@@ -82,10 +117,15 @@ class ClaudeAdapter(BaseAdapter):
         t = o.get("type", "")
         if t in ("user", "assistant", "tool_use", "tool_result"):
             return t
-        # unwrap {"message": {"role": ...}}
+        # unwrap {"message": {"role": ...}} or {"message": {"content": [...]}}
         m = o.get("message")
         if isinstance(m, dict):
-            return m.get("role", "")
+            r = m.get("role", "")
+            if r:
+                return r
+            # some builds nest rows as {"message": {"content": [tool_use...]}}
+            if isinstance(m.get("content"), (list, dict)):
+                return "assistant"
         return ""
 
     @staticmethod
@@ -135,6 +175,13 @@ class ClaudeAdapter(BaseAdapter):
                     names.add(nm)
             elif t == "tool_result":
                 n += 1
+            elif t == "assistant":
+                # nested tool calls in content blocks
+                m = o.get("message") or {}
+                content = m.get("content") if isinstance(m, dict) else o.get("content")
+                in_n, in_names = _content_tool_uses(content)
+                n += in_n
+                names |= in_names
         return n, names
 
     def is_watchdog_inject(self, text: str) -> bool:

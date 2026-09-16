@@ -64,6 +64,18 @@ tail /tmp/codex-watchdog.log
 看到 `continue #N (tools=…)` 即生效。日志文件与 Codex 共用同一个,状态也按
 session_id 区分,互不干扰。
 
+> 2026-09-16 已在本机端到端验证:`claude -p "Reply with exactly: watchdog-e2e-ok"`
+> 真实触发 Stop hook,日志出现 `continue #1`,链路可用。
+
+## 5. 真实转录适配说明
+
+Claude Code 的真实转录与 Codex 有两点差异,adapter 已处理:
+
+- **工具调用嵌在 assistant 的 content 块里**(`{"type":"tool_use",...}`),而不是独立
+  `tool_use` 行。adapter 会递归统计嵌套的 tool_use,避免把干活中的回合误判成"安静回合"。
+- **看门狗的 reason 会被 Claude 以 `Stop hook feedback:` 前缀注入成一条用户消息**。
+  adapter 已将其视为噪声,避免用它覆盖真正的用户输入(影响语言检测与 burst 重置)。
+
 ## 状态隔离
 
 - 状态:`/tmp/codex-watchdog/<claude_session_id>.json`
