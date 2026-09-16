@@ -54,9 +54,12 @@ except Exception as exc:  # pragma: no cover - fallback so hooks never crash
 
 # --- Explicit declarations the model is asked to make ---
 DECL_DONE = re.compile(
-    r"^\s*[『「【\"''“”]?\s*(任务完成|全部完成|已完成|完成。|done\.|done$|任务全部完成)", re.I | re.M)
+    r"^\s*[『「【\"''“”]?\s*(任务完成|全部完成|已完成|完成。|done\.|done$|任务全部完成|"
+    r"task\s+(is\s+)?(complete|done)|task\s+completed|all\s+(tasks|work)\s+(complete|done|finished)|"
+    r"fully\s+complete)", re.I | re.M)
 DECL_NEED_USER = re.compile(
-    r"^\s*[『「【\"''“”]?\s*(需要用户|需要你|need user|needs user|blocked|waiting for you|等待用户)", re.I | re.M)
+    r"^\s*[『「【\"''“”]?\s*(需要用户|需要你|need user|needs user|need your input|need your decision|"
+    r"waiting for (your|you)|blocked on (you|your|user)|awaiting (your|user)|等待用户)", re.I | re.M)
 
 # --- Classic DONE phrases (fallback when the agent did NOT use the protocol) ---
 DONE = re.compile(
@@ -272,13 +275,27 @@ def main() -> None:
     state["last_continue_at"] = now()
     state["last_msg"] = msg
     save_state(sid, state)
-    reason = (
+    last_prompt = last_user_prompt(ev) or ""
+    reason_en = (
+        "[watchdog] The task is not finished; keep working on the same task and "
+        "do not stop after a progress summary. When it is truly complete, say "
+        "『Task Complete』 and stop. When you need input, a choice, credentials, or "
+        "the user to decide on an optional step, say 『Need User』 and stop with the "
+        "question or options — do not keep acting or do optional work on your own. "
+        "Otherwise keep going."
+    )
+    reason_zh = (
         "[watchdog] 任务尚未完成,请继续执行刚才的任务,不要输出阶段总结就停下。"
         "如果任务已经真正全部完成,请直接说『任务完成』并结束;"
         "如果必须由用户提供信息、选择或凭据,或你想请用户做主/抛可选后续,请直接说『需要用户』并停下列出问题或选项,"
         "不要继续行动,也不要自己动手做可选事项;"
         "否则请继续执行,不要输出阶段总结就停下。"
     )
+    # Prefer Chinese when the session speaks Chinese or language is unknown.
+    if any('\u4e00' <= ch <= '\u9fff' for ch in last_prompt):
+        reason = reason_zh
+    else:
+        reason = reason_en
     log(f"{sid} continue #{state['count']} (tools={fc_count}): {msg[:60]!r}")
     print(json.dumps({"decision": "block", "reason": reason}))
 

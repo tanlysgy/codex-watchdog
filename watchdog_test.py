@@ -94,6 +94,37 @@ def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False):
     return json.loads(res) if res else {}
 
 
+def run_with_prompt(user_prompt, last_msg, sid="lang-reason"):
+    tp = tempfile.mktemp(suffix=".jsonl")
+    with open(tp, "w") as f:
+        f.write(json.dumps(user_msg(user_prompt)) + "\n")
+        f.write(json.dumps(turn_start()) + "\n")
+    ev = {
+        "session_id": sid,
+        "hook_event_name": "Stop",
+        "transcript_path": tp,
+        "cwd": "/tmp",
+        "last_assistant_message": last_msg,
+    }
+    sp = os.path.join(wd.STATE_DIR, f"{sid}.json")
+    wd.save_state(sid, {"count": 0, "last_continue_at": None, "last_msg": None,
+                        "quiet_turns": 0, "activated": True})
+    old_in, old_out = sys.stdin, sys.stdout
+    sys.stdin = io.StringIO(json.dumps(ev))
+    out = io.StringIO()
+    sys.stdout = out
+    try:
+        wd.main()
+        res = json.loads(out.getvalue().strip() or "{}")
+    finally:
+        sys.stdin, sys.stdout = old_in, old_out
+    try:
+        os.remove(sp)
+    except OSError:
+        pass
+    return res
+
+
 def main():
     inj = user_msg("[watchdog] 任务尚未完成,请继续执行")
     env = user_msg("<environment_context>\n  <current_date>2026-09-13</current_date>")
@@ -190,6 +221,23 @@ def main():
                  seed={"count": 0, "last_continue_at": None, "last_msg": None,
                        "quiet_turns": 0, "activated": True})
     check("agent offers optional next step -> continue(stop)", r.get("continue"), True)
+
+    # ---- English protocol declarations are honored at protocol level ----
+    r = run_main([turn_start(), tool_call()], "Task Complete.", sid="s16",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True})
+    check("english protocol Task Complete (with tools) -> continue(stop)", r.get("continue"), True)
+
+    r = run_main([turn_start(), tool_call()], "Need User: please provide the API key.", sid="s17",
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True})
+    check("english protocol Need User -> continue(stop)", r.get("continue"), True)
+
+    # ---- bilingual reason follows session language (Chinese vs English) ----
+    r_zh = run_with_prompt("继续做 P7.5,中文会话", "还没做完,继续", sid="s18")
+    r_en = run_with_prompt("continue with the task", "not done yet, keep going", sid="s19")
+    check("reason follows zh session", "任务尚未完成" in (r_zh.get("reason") or ""), True)
+    check("reason follows en session", "The task is not finished" in (r_en.get("reason") or ""), True)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
