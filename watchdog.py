@@ -14,8 +14,8 @@ Agent-agnostic via adapters/:
 Select with env CODEX_WATCHDOG_ADAPTER=claude (or codex).
 
 Evidence-driven finish detection:
-  1. Declared protocol: message starts with 任务完成/『任务完成』/done -> stop;
-     需要用户/『需要用户』/need user -> stop (blocked on user).
+  1. Declared protocol: a line that is exactly 任务完成/『任务完成』/Task Complete
+     -> stop; 需要用户/『需要用户』/Need User -> stop (blocked on user).
   2. Burst budget: N auto-continues with no real user input -> stop.
   3. Repeated identical final message -> stop (no progress).
   4. Short genuine need-user request -> stop.
@@ -31,7 +31,7 @@ Runtime v1.1 observability (all optional, zero new dependencies):
   - Checkpoint: a lightweight snapshot (last message, state, counters) written
     every N continues and on every state change, under
     /tmp/codex-watchdog/checkpoints/.
-  - Metrics: aggregates derived from the event log at
+  - Metrics: per-session and global aggregates derived from the event log at
     /tmp/codex-watchdog/metrics.json.
 
 State: /tmp/codex-watchdog/<session_id>.json
@@ -39,7 +39,6 @@ Log:   /tmp/codex-watchdog.log
 """
 import json
 import os
-import re
 import sys
 import time
 
@@ -48,17 +47,73 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import watchdog_protocol as protocol  # noqa: E402
 from adapters import load_adapter  # noqa: E402
 
-STATE_DIR = os.environ.get("CODEX_WATCHDOG_STATE_DIR", "/tmp/codex-watchdog")
-LOG_FILE = os.environ.get("CODEX_WATCHDOG_LOG", "/tmp/codex-watchdog.log")
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse an int env var without ever raising.
+
+    A hook must never crash: a typo in a config value degrades to the default
+    (and is logged) instead of aborting the turn.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = int(str(raw).strip())
+    except ValueError:
+        sys.stderr.write(f"watchdog: ignoring invalid {name}={raw!r}; using {default}\n")
+        return default
+    if val < minimum:
+        sys.stderr.write(f"watchdog: ignoring out-of-range {name}={val}; using {default}\n")
+        return default
+    return val
+
+
+def _env_float(name: str, default: float, minimum: float = 1.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = float(str(raw).strip())
+    except ValueError:
+        sys.stderr.write(f"watchdog: ignoring invalid {name}={raw!r}; using {default}\n")
+        return default
+    if val < minimum:
+        sys.stderr.write(f"watchdog: ignoring out-of-range {name}={val}; using {default}\n")
+        return default
+    return val
+
+
+# Portable default state root. On POSIX we keep the historical /tmp paths so
+# existing installs, docs and `tail /tmp/codex-watchdog.log` keep working; only
+# platforms without /tmp (Windows) fall back to the platform temp dir.
+def _default_state_dir() -> str:
+    if os.name != "nt" and os.path.isdir("/tmp"):
+        return "/tmp/codex-watchdog"
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "codex-watchdog")
+
+
+def _default_log_file() -> str:
+    if os.name != "nt" and os.path.isdir("/tmp"):
+        return "/tmp/codex-watchdog.log"
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "codex-watchdog.log")
+
+
+STATE_DIR = os.environ.get("CODEX_WATCHDOG_STATE_DIR") or _default_state_dir()
+LOG_FILE = os.environ.get("CODEX_WATCHDOG_LOG") or _default_log_file()
 EVENTS_FILE = os.path.join(STATE_DIR, "events.jsonl")
 METRICS_FILE = os.path.join(STATE_DIR, "metrics.json")
 CHECKPOINT_DIR = os.path.join(STATE_DIR, "checkpoints")
-BURST_MAX = int(os.environ.get("CODEX_WATCHDOG_MAX", "60"))
-RESET_AFTER_SEC = float(os.environ.get("CODEX_WATCHDOG_RESET", "1800"))
-QUIET_TURNS_MAX = int(os.environ.get("CODEX_WATCHDOG_QUIET", "3"))
-CHECKPOINT_EVERY = int(os.environ.get("CODEX_WATCHDOG_CHECKPOINT", "5"))
+BURST_MAX = _env_int("CODEX_WATCHDOG_MAX", 60)
+RESET_AFTER_SEC = _env_float("CODEX_WATCHDOG_RESET", 1800.0)
+QUIET_TURNS_MAX = _env_int("CODEX_WATCHDOG_QUIET", 3)
+CHECKPOINT_EVERY = _env_int("CODEX_WATCHDOG_CHECKPOINT", 5)
+EVENTS_MAX_BYTES = _env_int("CODEX_WATCHDOG_EVENTS_MAX", 2_000_000)
+STATE_TTL_SEC = _env_float("CODEX_WATCHDOG_TTL", 7 * 86400.0)
 ADAPTER_NAME = os.environ.get("CODEX_WATCHDOG_ADAPTER", "codex")
 
 # --- TaskState ---
@@ -67,65 +122,29 @@ BLOCKED = "BLOCKED"
 COMPLETED = "COMPLETED"
 STALLED = "STALLED"
 
+# How many consecutive auto-continues a host will tolerate before it overrides
+# the hook itself. Claude Code ends the turn after 8 consecutive blocks
+# (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP, default 8); Codex has no such host cap, so
+# there we rely on BURST_MAX alone. Knowing this keeps our own budget honest:
+# a budget above the host cap is unreachable on that host.
+HOST_BLOCK_CAP = _env_int("CODEX_WATCHDOG_HOST_CAP", 8 if ADAPTER_NAME == "claude" else 0,
+                          minimum=0)
+
 try:
     ADAPTER = load_adapter(ADAPTER_NAME)
 except Exception as exc:  # pragma: no cover - fallback so hooks never crash
     sys.stderr.write(f"watchdog: failed to load adapter {ADAPTER_NAME!r}: {exc}\n")
     ADAPTER = None
 
-# --- Explicit declarations the model is asked to make ---
-DECL_DONE = re.compile(
-    r"^\s*[『「【\"''“”]?\s*(任务完成|全部完成|已完成|完成。|done\.|done$|任务全部完成|"
-    r"task\s+(is\s+)?(complete|done)|task\s+completed|all\s+(tasks|work)\s+(complete|done|finished)|"
-    r"fully\s+complete)", re.I | re.M)
-DECL_NEED_USER = re.compile(
-    r"^\s*[『「【\"''“”]?\s*(需要用户|需要你|need user|needs user|need your input|need your decision|"
-    r"waiting for (your|you)|blocked on (you|your|user)|awaiting (your|user)|等待用户)", re.I | re.M)
-
-# --- Classic DONE phrases (fallback when the agent did NOT use the protocol) ---
-DONE = re.compile(
-    r"(任务(已?全部)?完成|全部完成|已经完成|已完成|完成收尾|全部做好|"
-    r"没有更多(工作|任务|事项)|无(需|须)(再|任何)(工作|修改|任务|事项)|"
-    r"all done|task (is )?(complete|done)|fully (complete|done)|"
-    r"no (more|further|remaining) (work|tasks|steps)|nothing (left|more|else)|"
-    r"finished|搞定了|行了|收工|就此结束|到此为止|已完成所有|没有其他工作)",
-    re.I,
-)
-
-# --- Genuine short requests for user input ---
-NEED_USER = re.compile(
-    r"(请(您|你)?(提供|输入|确认|决定|告诉我|给出|选择|设置|说明|回复|告知)|"
-    r"需要(您|你|用户)?(提供|输入|确认|批准|授权|告知|选择|决定|告诉我)|"
-    r"(等待|等)(您|你|用户)(的)?(输入|确认|决定|指示|消息|答复|要求|选择)|"
-    r"please (provide|enter|confirm|decide|tell|give|choose|explain)|"
-    r"waiting for (your|you|user)|need (your|you|user) (input|confirmation|decision|approval)|"
-    r"asked for (your|user) (input|confirmation|decision)|"
-    r"needs? (your|user) (input|confirmation|decision|approval))",
-    re.I,
-)
-
-RHETORICAL = re.compile(r"[吗么呢]+\s*[??!!。]?\s*(不(需要|用|必)|无需|不必|我自己|我来|我可以|我会|算了)")
-
-# Conversation patterns where the agent is handing control back to the user
-# (offering options, asking a question, or asking for a decision). When a
-# turn ends on one of these, we must STOP and wait — auto-continuing past a
-# genuine question is annoying and can even modify the repo without consent.
-PROMPT_FOR_INPUT = re.compile(
-    r"(要不要|需不需要|是否(需要|要)|你(想|觉得|希望|要不要)(怎么|如何|用|选|做)?|"
-    r"你(来)?(选|决定|拍板|拿主意|确认一下?|说了算)|"
-    r"等(你|您|您来|你来)(选|决定|确认|拍板|拿主意|输入|回复|答复|告诉|选择|指示|消息)|"
-    r"请(你|您)?(选|决定|确认|拍板|输入|回复|答复|告诉|选择|指示|告知|提供)|"
-    r"(\?|？|吗|呢)$|"
-    r"which (option|one|approach)|what do you (want|prefer|think)|"
-    r"(do|would) you (want|like|prefer)|your (call|choice|decision)|"
-    r"(waiting|wait) for (your|you) (input|decision|choice|answer|confirmation)|"
-    r"let me know (if|what|how|whether)|tell me (if|what|how|whether))",
-    re.I,
-)
+DONE = protocol.DONE
+NEED_USER = protocol.NEED_USER
+RHETORICAL = protocol.RHETORICAL
+PROMPT_FOR_INPUT = protocol.PROMPT_FOR_INPUT
 
 
 def log(msg: str) -> None:
     try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         with open(LOG_FILE, "a") as f:
             f.write(f"{time.strftime('%F %T')} {msg}\n")
     except OSError:
@@ -148,8 +167,13 @@ def load_state(sid: str) -> dict:
 
 def save_state(sid: str, state: dict) -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(os.path.join(STATE_DIR, f"{sid}.json"), "w") as f:
+    path = os.path.join(STATE_DIR, f"{sid}.json")
+    tmp = f"{path}.tmp"
+    # Atomic replace: a concurrent Stop hook (or a crash) must never leave a
+    # half-written state file behind, or the next run silently loses the budget.
+    with open(tmp, "w") as f:
         json.dump(state, f)
+    os.replace(tmp, path)
 
 
 def session_activated(ev: dict, state: dict) -> bool:
@@ -188,6 +212,16 @@ def last_turn_tool_activity(ev: dict):
     return ADAPTER.last_turn_tool_activity(ev)
 
 
+def turn_metadata(ev: dict) -> dict:
+    """Normalized turn snapshot from the active adapter (checkpoint metadata)."""
+    if ADAPTER is None or not hasattr(ADAPTER, "checkpoint_metadata"):
+        return {}
+    try:
+        return ADAPTER.checkpoint_metadata(ev)
+    except Exception:  # pragma: no cover - metadata is best-effort
+        return {}
+
+
 def is_watchdog_inject(text: str) -> bool:
     if ADAPTER is None:
         return "[watchdog]" in (text or "")
@@ -208,9 +242,9 @@ def should_reset_burst(state: dict, ev: dict) -> bool:
     return False
 
 
-# --- Structured Event Log (JSONL) ---
+# --- Structured Event Log (JSONL) -------------------------------------------
 
-def read_events() -> list:
+def read_events(sid: str = None) -> list:
     events = []
     try:
         with open(EVENTS_FILE) as f:
@@ -219,18 +253,33 @@ def read_events() -> list:
                 if not line:
                     continue
                 try:
-                    events.append(json.loads(line))
+                    row = json.loads(line)
                 except ValueError:
                     continue
+                if sid is None or row.get("session_id") == sid:
+                    events.append(row)
     except OSError:
         pass
     return events
 
 
+def rotate_events_if_needed() -> None:
+    """Keep the event log bounded: move the current file aside when too big."""
+    try:
+        if os.path.getsize(EVENTS_FILE) < EVENTS_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        os.replace(EVENTS_FILE, EVENTS_FILE + ".1")
+    except OSError:
+        pass
+
+
 def emit_event(sid: str, event: str, status: str, reason: str,
-               continue_count: int) -> None:
+               continue_count: int, metrics: dict = None) -> None:
     ev = {
-        "timestamp": time.strftime("%F %T"),
+        "timestamp": time.time(),
         "session_id": sid,
         "event": event,
         "state": status,
@@ -242,109 +291,209 @@ def emit_event(sid: str, event: str, status: str, reason: str,
         with open(EVENTS_FILE, "a") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
     except OSError:
-        pass
-    update_metrics()
+        return
+    if metrics is not None:
+        fold_metric(metrics, event, reason)
+    rotate_events_if_needed()
 
 
-# --- Metrics (derived from the event log) ---
+# --- Metrics (derived from this session's event log slice) -------------------
 
-def update_metrics() -> None:
-    events = read_events()
-    total_continues = sum(1 for e in events if e.get("event") == "continue")
-    sessions = {e.get("session_id") for e in events if e.get("event") == "continue"}
-    avg = round(total_continues / len(sessions), 2) if sessions else 0
+def fold_metric(m: dict, event: str, reason: str) -> None:
+    """Update this session's counters with one event (incremental, O(1))."""
+    if event == "continue":
+        m["continues"] = m.get("continues", 0) + 1
+    elif event in ("completed", "blocked", "stalled"):
+        key = f"{event}_count"
+        m[key] = m.get(key, 0) + 1
+        if event == "stalled" and "quiet" in (reason or "").lower():
+            m["quiet_turn_hits"] = m.get("quiet_turn_hits", 0) + 1
+    prev = m.get("last_event")
+    if event == "continue":
+        if prev == "stalled":
+            m["stalled_recovered"] = m.get("stalled_recovered", 0) + 1
+        elif prev == "completed":
+            m["completed_then_continued"] = m.get("completed_then_continued", 0) + 1
+        elif prev == "blocked":
+            m["blocked_then_continued"] = m.get("blocked_then_continued", 0) + 1
+    m["last_event"] = event
 
-    stop_dist = {}
+
+def session_metrics(sid: str) -> dict:
+    """Per-session metrics for the current state (derived from the event log)."""
+    events = read_events(sid)
+    m = {}
     for e in events:
-        if e.get("event") in ("completed", "blocked", "stalled"):
-            stop_dist[e["event"]] = stop_dist.get(e["event"], 0) + 1
+        fold_metric(m, e.get("event"), e.get("reason") or "")
+    return m
 
-    quiet_turn_hits = sum(
-        1 for e in events
-        if e.get("event") == "stalled" and "quiet" in (e.get("reason") or "").lower()
-    )
 
-    stalled_recovered = completed_then_continued = blocked_then_continued = 0
-    by_sid = {}
-    for e in events:
-        by_sid.setdefault(e.get("session_id"), []).append(e)
-    for seq in by_sid.values():
-        prev = None
-        for e in seq:
-            if e.get("event") == "continue":
-                if prev == "stalled":
-                    stalled_recovered += 1
-                elif prev == "completed":
-                    completed_then_continued += 1
-                elif prev == "blocked":
-                    blocked_then_continued += 1
-            prev = e.get("event")
+def update_metrics(sid: str, metrics: dict) -> None:
+    """Merge this session's metrics into the global metrics file.
 
-    metrics = {
-        "total_continues": total_continues,
-        "average_continue_rounds": avg,
-        "stop_reason_distribution": stop_dist,
-        "quiet_turn_hits": quiet_turn_hits,
-        "stalled_recovered": stalled_recovered,
-        "completed_then_continued": completed_then_continued,
-        "blocked_then_continued": blocked_then_continued,
+    Only the per-session slice is aggregated (not the whole log re-parsed for
+    every event), so the cost stays flat as the event log grows.
+    """
+    try:
+        with open(METRICS_FILE) as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict):
+            doc = {}
+    except (OSError, ValueError):
+        doc = {}
+    sessions = doc.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+    sessions[sid] = {
+        "continues": metrics.get("continues", 0),
+        "completed": metrics.get("completed_count", 0),
+        "blocked": metrics.get("blocked_count", 0),
+        "stalled": metrics.get("stalled_count", 0),
+        "quiet_turn_hits": metrics.get("quiet_turn_hits", 0),
+        "stalled_recovered": metrics.get("stalled_recovered", 0),
+        "completed_then_continued": metrics.get("completed_then_continued", 0),
+        "blocked_then_continued": metrics.get("blocked_then_continued", 0),
+        "last_event": metrics.get("last_event"),
         "updated_at": time.strftime("%F %T"),
     }
+    doc["sessions"] = sessions
+    doc["totals"] = {
+        "sessions": len(sessions),
+        "continues": sum(s.get("continues", 0) for s in sessions.values()),
+        "average_continue_rounds": round(
+            sum(s.get("continues", 0) for s in sessions.values())
+            / max(1, sum(1 for s in sessions.values() if s.get("continues", 0))), 2),
+        "stop_reason_distribution": {
+            "completed": sum(s.get("completed", 0) for s in sessions.values()),
+            "blocked": sum(s.get("blocked", 0) for s in sessions.values()),
+            "stalled": sum(s.get("stalled", 0) for s in sessions.values()),
+        },
+        "quiet_turn_hits": sum(s.get("quiet_turn_hits", 0) for s in sessions.values()),
+        "stalled_recovered": sum(s.get("stalled_recovered", 0) for s in sessions.values()),
+        "completed_then_continued": sum(
+            s.get("completed_then_continued", 0) for s in sessions.values()),
+        "blocked_then_continued": sum(
+            s.get("blocked_then_continued", 0) for s in sessions.values()),
+    }
+    doc["updated_at"] = time.strftime("%F %T")
     try:
+        os.makedirs(STATE_DIR, exist_ok=True)
         with open(METRICS_FILE, "w") as f:
-            json.dump(metrics, f, ensure_ascii=False, indent=2)
+            json.dump(doc, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
 
-# --- Lightweight Checkpoint ---
+# --- Lightweight Checkpoint -------------------------------------------------
 
 def write_checkpoint(sid: str, state: dict, msg: str, fc_count: int,
-                     fc_names: set, reason: str) -> None:
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+                     fc_names: set, reason: str, metadata: dict = None) -> None:
+    """Snapshot the turn so a later run (or a human) can resume from it."""
+    md = metadata if metadata is not None else {}
+    tool_calls = md.get("tool_calls", fc_count)
+    tool_names = md.get("tool_names") or sorted(fc_names)
     cp = {
-        "timestamp": time.strftime("%F %T"),
+        "timestamp": time.time(),
+        "time": time.strftime("%F %T"),
         "session_id": sid,
         "status": state.get("status"),
         "continue_count": state.get("count", 0),
         "quiet_turns": state.get("quiet_turns", 0),
         "last_message": msg,
-        "tool_calls": fc_count,
-        "tool_names": sorted(fc_names),
+        "tool_calls": tool_calls,
+        "tool_names": tool_names,
+        "completion_signal": md.get("completion_signal"),
+        "need_user_signal": md.get("need_user_signal"),
         "reason": reason,
     }
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = os.path.join(CHECKPOINT_DIR, f"{sid}.json")
     try:
-        with open(os.path.join(CHECKPOINT_DIR, f"{sid}.json"), "w") as f:
+        with open(path, "w") as f:
             json.dump(cp, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
 
-# --- Terminal / continue transitions ---
+# --- Housekeeping -----------------------------------------------------------
+
+def cleanup_stale_state() -> None:
+    """Drop session state/checkpoints that have not been touched for STATE_TTL.
+
+    /tmp is not garbage collected for us, and every session leaves a state file
+    plus a checkpoint behind forever.
+    """
+    cutoff = now() - STATE_TTL_SEC
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json") or name in ("metrics.json",):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
+    try:
+        names = os.listdir(CHECKPOINT_DIR)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(CHECKPOINT_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
+
+
+def maybe_cleanup() -> None:
+    """Run housekeeping at most once an hour, recorded by a stamp file."""
+    stamp = os.path.join(STATE_DIR, ".last-cleanup")
+    try:
+        if os.path.getmtime(stamp) > now() - 3600:
+            return
+    except OSError:
+        pass
+    cleanup_stale_state()
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(stamp, "w") as f:
+            f.write(str(now()))
+    except OSError:
+        pass
+
+
+# --- Terminal / continue transitions ---------------------------------------
 
 def stop(sid: str, state: dict, status: str, reason: str, msg: str,
-         fc_count: int, fc_names: set) -> None:
+         fc_count: int, fc_names: set, metrics: dict, metadata: dict = None) -> None:
     state["status"] = status
     state["updated_at"] = now()
     state["reason"] = reason
-    emit_event(sid, status.lower(), status, reason, state.get("count", 0))
-    write_checkpoint(sid, state, msg, fc_count, fc_names, reason)
+    emit_event(sid, status.lower(), status, reason, state.get("count", 0), metrics)
+    write_checkpoint(sid, state, msg, fc_count, fc_names, reason, metadata)
+    update_metrics(sid, metrics)
     save_state(sid, state)
     log(f"{sid} {status}: {reason}")
     print(json.dumps({"continue": True}))
 
 
 def keep_going(sid: str, state: dict, msg: str, fc_count: int, fc_names: set,
-               reason: str) -> None:
+               reason: str, metrics: dict, metadata: dict = None) -> None:
     state["count"] = state.get("count", 0) + 1
     state["last_continue_at"] = now()
     state["last_msg"] = msg
     state["status"] = RUNNING
     state["updated_at"] = now()
     state["reason"] = reason
-    emit_event(sid, "continue", RUNNING, reason, state["count"])
+    emit_event(sid, "continue", RUNNING, reason, state["count"], metrics)
     if state["count"] % CHECKPOINT_EVERY == 0:
-        write_checkpoint(sid, state, msg, fc_count, fc_names, reason)
+        write_checkpoint(sid, state, msg, fc_count, fc_names, reason, metadata)
+    update_metrics(sid, metrics)
     save_state(sid, state)
     log(f"{sid} continue #{state['count']} (tools={fc_count}): {msg[:60]!r}")
     print(json.dumps({"decision": "block", "reason": reason}))
@@ -373,33 +522,49 @@ def main() -> None:
         state["last_msg"] = None
 
     fc_count, fc_names = last_turn_tool_activity(ev)
+    metadata = turn_metadata(ev)
+    metrics = session_metrics(sid)
 
     # First time we see this session -> record task_started.
     if state.get("status") is None:
         state["status"] = RUNNING
-        emit_event(sid, "task_started", RUNNING, "session started", 0)
+        emit_event(sid, "task_started", RUNNING, "session started", 0, metrics)
 
     # ---- 1. declared protocol (highest priority) ----
-    if DECL_DONE.search(msg):
-        return stop(sid, state, COMPLETED, "declared done", msg, fc_count, fc_names)
-    if DECL_NEED_USER.search(msg):
-        return stop(sid, state, BLOCKED, "declared need-user", msg, fc_count, fc_names)
+    if protocol.is_completion_declaration(msg):
+        return stop(sid, state, COMPLETED, "declared done", msg,
+                    fc_count, fc_names, metrics, metadata)
+    if protocol.is_need_user_declaration(msg):
+        return stop(sid, state, BLOCKED, "declared need-user", msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 2. burst guard ----
-    if state.get("count", 0) >= BURST_MAX:
-        return stop(sid, state, STALLED, "burst exhausted", msg, fc_count, fc_names)
+    # The effective ceiling is the smaller of our budget and what the host will
+    # actually honour (Claude Code stops accepting blocks after 8).
+    effective_max = BURST_MAX
+    if HOST_BLOCK_CAP:
+        effective_max = min(effective_max, HOST_BLOCK_CAP)
+    if state.get("count", 0) >= effective_max:
+        reason = "burst exhausted"
+        if HOST_BLOCK_CAP and effective_max == HOST_BLOCK_CAP < BURST_MAX:
+            reason = f"host block cap reached ({HOST_BLOCK_CAP})"
+        return stop(sid, state, STALLED, reason, msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 3. repeated final message ----
     if state.get("last_msg") and msg and msg == state["last_msg"]:
-        return stop(sid, state, STALLED, "repeated final message", msg, fc_count, fc_names)
+        return stop(sid, state, STALLED, "repeated final message", msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 4. short genuine need-user request ----
     if len(msg) <= 160 and NEED_USER.search(msg) and not RHETORICAL.search(msg):
-        return stop(sid, state, BLOCKED, "needs user", msg, fc_count, fc_names)
+        return stop(sid, state, BLOCKED, "needs user", msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 4b. agent offered options / asked for a decision -> stop & wait ----
     if len(msg) <= 400 and PROMPT_FOR_INPUT.search(msg):
-        return stop(sid, state, BLOCKED, "prompt-for-input", msg, fc_count, fc_names)
+        return stop(sid, state, BLOCKED, "prompt-for-input", msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 5. tool evidence for the just-finished turn ----
     if fc_count <= 0:
@@ -410,11 +575,12 @@ def main() -> None:
     # ---- 6. fallback DONE (only stop if this was a quiet turn) ----
     if state.get("quiet_turns", 0) >= 1 and DONE.search(msg):
         return stop(sid, state, COMPLETED, "done (quiet turn + done phrase)",
-                    msg, fc_count, fc_names)
+                    msg, fc_count, fc_names, metrics, metadata)
 
     # ---- 7. too many quiet turns in a row -> stop (spinning) ----
     if state.get("quiet_turns", 0) >= QUIET_TURNS_MAX:
-        return stop(sid, state, STALLED, "quiet turns", msg, fc_count, fc_names)
+        return stop(sid, state, STALLED, "quiet turns", msg,
+                    fc_count, fc_names, metrics, metadata)
 
     # ---- 8. otherwise keep going ----
     last_prompt = last_user_prompt(ev) or ""
@@ -438,8 +604,15 @@ def main() -> None:
         reason = reason_zh
     else:
         reason = reason_en
-    return keep_going(sid, state, msg, fc_count, fc_names, reason)
+    return keep_going(sid, state, msg, fc_count, fc_names, reason, metrics, metadata)
+
+
+def _run() -> None:
+    try:
+        main()
+    finally:
+        maybe_cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    _run()

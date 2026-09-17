@@ -19,10 +19,16 @@ Privacy note: we only read the LAST N lines and never write anything there.
 """
 import json
 import os
-import re
-from .base import BaseAdapter
+import sys
+from .base import BaseAdapter, cached_rows
 
 NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions", "Stop hook feedback:")
+
+# Protocols live in one place so the hook and the adapters cannot disagree.
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import watchdog_protocol as protocol  # noqa: E402
 
 
 def _content_tool_uses(content):
@@ -86,7 +92,7 @@ class ClaudeAdapter(BaseAdapter):
     name = "claude"
 
     @staticmethod
-    def _rows(path, n=600):
+    def _parse(path, n=600):
         if not path or not os.path.exists(path):
             return []
         try:
@@ -109,6 +115,10 @@ class ClaudeAdapter(BaseAdapter):
             except ValueError:
                 continue
         return rows
+
+    @classmethod
+    def _rows(cls, path, n=600):
+        return cached_rows(cls._parse, path, n)
 
     @staticmethod
     def _entry_role(o) -> str:
@@ -211,16 +221,6 @@ class ClaudeAdapter(BaseAdapter):
             "final_message": msg,
             "tool_calls": fc_count,
             "tool_names": sorted(fc_names),
-            "completion_signal": bool(
-                re.search(r"^\s*[『「【\"''“”]?\s*(任务完成|全部完成|已完成|done\.|done$|"
-                          r"task\s+(is\s+)?(complete|done)|task\s+completed|all\s+(tasks|work)\s+"
-                          r"(complete|done|finished)|fully\s+complete)",
-                          msg, re.I | re.M)
-            ),
-            "need_user_signal": bool(
-                re.search(r"^\s*[『「【\"''“”]?\s*(需要用户|需要你|need user|needs user|"
-                          r"need your input|need your decision|waiting for (your|you)|"
-                          r"blocked on (you|your|user)|awaiting (your|user)|等待用户)",
-                          msg, re.I | re.M)
-            ),
+            "completion_signal": protocol.is_completion_declaration(msg),
+            "need_user_signal": protocol.is_need_user_declaration(msg),
         }

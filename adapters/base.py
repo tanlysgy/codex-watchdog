@@ -1,4 +1,28 @@
-"""Abstract adapter contract. Subclass and implement the four callbacks."""
+"""Abstract adapter contract. Subclass and implement the four callbacks.
+
+A Stop hook is a short-lived process that asks several questions about the same
+transcript (last user prompt, tool activity, checkpoint metadata). Re-reading and
+re-parsing the file for each question is pure waste, so adapters share one
+per-process row cache via `cached_rows`.
+"""
+
+# path -> parsed rows, scoped to this short-lived process.
+_ROW_CACHE = {}
+
+
+def cached_rows(fetch, path, n=600):
+    """Parse a transcript at most once per path within this process.
+
+    Different callers ask for different windows (600 lines for the user prompt,
+    400 for tool activity). A smaller request is served by slicing an already
+    parsed larger window instead of re-reading the file.
+    """
+    entry = _ROW_CACHE.get(path)
+    if entry is not None and entry[0] >= n:
+        return entry[1][-n:] if entry[0] != n else entry[1]
+    rows = fetch(path, n)
+    _ROW_CACHE[path] = (n, rows)
+    return rows
 
 
 class BaseAdapter:
@@ -36,6 +60,9 @@ class BaseAdapter:
           - tool_names (list)
           - completion_signal (bool)  -- agent declared the task done
           - need_user_signal (bool)   -- agent declared it needs the user
+
+        The engine calls this on every Stop hook, so implementations should stay
+        cheap (the shared row cache makes the transcript read essentially free).
         """
         return {
             "session_id": ev.get("session_id"),

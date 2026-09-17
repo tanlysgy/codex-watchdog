@@ -43,6 +43,10 @@ Codex 每回合结束会触发 `Stop` hook → 运行 `watchdog.py` → 脚本�
 | 连续 60 次自动续推、无用户输入 | 停(兜底) |
 | 空闲超过 30 分钟 | 重置预算 |
 
+声明只在**独占一行**时才成立(可跟标点与简短说明)。像
+`已完成 3/7 个文件,还剩 4 个` 或 `任务完成度约 60%,继续推进` 这类进度叙述
+**不算**完成声明,看门狗会继续推进。
+
 ### 安装
 
 ```bash
@@ -62,7 +66,8 @@ bash install.sh
 ### 验证
 
 ```bash
-python3 watchdog_test.py    # 回归测试(11 项)
+python3 watchdog_test.py    # 回归测试(68 项)
+python3 adapters_test.py    # adapter 测试(38 项)
 tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 ```
 
@@ -93,6 +98,24 @@ tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 bash install.sh --uninstall
 # 或手动移除 ~/.codex/hooks.json 里的 watchdog 条目与 ~/.codex/watchdog.*
 ```
+
+### 可观测性与运行时有界性
+
+看门狗为每个会话维护一个轻量任务状态机(`RUNNING` / `BLOCKED` / `COMPLETED` /
+`STALLED`),并写入结构化事件流与检查点:
+
+- 事件流:`/tmp/codex-watchdog/events.jsonl`(`task_started` / `continue` / `blocked` /
+  `completed` / `stalled`)
+- 检查点:`/tmp/codex-watchdog/checkpoints/<session_id>.json`
+- 指标:`/tmp/codex-watchdog/metrics.json`(按会话 + 总计,增量聚合)
+
+运行时有界,不会无限增长:事件流超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)会轮转;
+空闲超过 `CODEX_WATCHDOG_TTL`(默认 7 天)的会话状态与检查点会被清理;状态文件原子写入,
+崩溃不会破坏续推预算。环境变量写错(非法值、空串、越界)只会退回默认值,不会让 hook 崩溃。
+
+**注意宿主上限**:Claude Code 在连续 8 次 `decision:"block"` 后会自己结束回合
+(`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),所以在其上默认取 `min(60, 8)`;Codex 没有这个上限,
+完全依赖 `CODEX_WATCHDOG_MAX` 自我约束。详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ### 同类项目对比与已知局限
 

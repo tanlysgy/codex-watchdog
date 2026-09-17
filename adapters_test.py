@@ -152,7 +152,49 @@ md4 = base.checkpoint_metadata({"session_id": "s-meta4", "last_assistant_message
 check("base: metadata default tool_calls", md4.get("tool_calls"), 0)
 check("base: metadata default completion_signal", md4.get("completion_signal"), False)
 
-for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb):
+# ---- both adapters must agree with the shared protocol (no vocabulary drift) ----
+import watchdog_protocol as _p  # noqa: E402
+_empty = write_tmp([])
+for label, ad in (("codex", codex), ("claude", claude)):
+    for msg, want in (("任务完成", True), ("已完成初步分析,下面开始实现", False)):
+        got = ad.checkpoint_metadata({"session_id": "x", "transcript_path": _empty,
+                                      "last_assistant_message": msg})
+        check(f"{label}: completion_signal matches protocol for {msg[:10]!r}",
+              got.get("completion_signal"), want)
+    for msg, want in (("需要用户:请提供凭据", True), ("继续干活", False)):
+        got = ad.checkpoint_metadata({"session_id": "x", "transcript_path": _empty,
+                                      "last_assistant_message": msg})
+        check(f"{label}: need_user_signal matches protocol for {msg[:10]!r}",
+              got.get("need_user_signal"), want)
+check("adapters share one protocol module",
+      codex.checkpoint_metadata({"transcript_path": _empty,
+                                 "last_assistant_message": "任务完成"}).get("completion_signal")
+      == _p.is_completion_declaration("任务完成"), True)
+
+# ---- transcript is parsed once per (path, n) per process ----
+from adapters.base import _ROW_CACHE  # noqa: E402
+from adapters.codex import CodexAdapter  # noqa: E402
+_ROW_CACHE.clear()
+_calls = {"n": 0}
+_real = CodexAdapter._parse
+
+
+def _counting(path, n=600):
+    _calls["n"] += 1
+    return _real(path, n)
+
+
+CodexAdapter._parse = staticmethod(_counting)
+p_cache = write_tmp([codex_user("继续"), {"type": "turn_context", "payload": {}},
+                     codex_fc("exec_command")])
+codex.last_user_prompt({"transcript_path": p_cache})
+codex.last_turn_tool_activity({"transcript_path": p_cache})
+codex.checkpoint_metadata({"transcript_path": p_cache, "last_assistant_message": "x"})
+CodexAdapter._parse = staticmethod(_real)
+check("three questions, one parse", _calls["n"], 1)
+_ROW_CACHE.clear()
+
+for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb, _empty, p_cache):
     try:
         os.remove(p)
     except OSError:

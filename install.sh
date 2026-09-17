@@ -29,15 +29,16 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 if [ -n "${UNINSTALL:-}" ]; then
   echo "==> 卸载:删除 $DEST/watchdog.* 与 adapters/ =="
-  rm -f "$DEST/watchdog.py" "$DEST/watchdog_test.py" "$DEST/watchdog.enabled"
+  rm -f "$DEST/watchdog.py" "$DEST/watchdog_protocol.py" "$DEST/watchdog_test.py" "$DEST/watchdog.enabled"
   rm -rf "$DEST/adapters"
   echo "  已删除。请手动从 $DEST/hooks.json(Codex)或 $DEST/settings.json(Claude)移除 watchdog 条目。"
   exit 0
 fi
 
 mkdir -p "$DEST"
-echo "==> 1/5 复制 watchdog.py → $DEST/"
+echo "==> 1/5 复制 watchdog.py + watchdog_protocol.py → $DEST/"
 cp "$SRC/watchdog.py" "$DEST/watchdog.py"
+cp "$SRC/watchdog_protocol.py" "$DEST/watchdog_protocol.py"
 chmod +x "$DEST/watchdog.py"
 
 echo "==> 2/5 复制 adapters/ → $DEST/"

@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile watchdog.py
-        run: python -m py_compile watchdog.py watchdog_test.py
+        run: python -m py_compile watchdog.py watchdog_protocol.py watchdog_test.py adapters/base.py adapters/codex.py adapters/claude.py
       - name: Run regression tests
         run: python watchdog_test.py
       - name: Run adapter tests

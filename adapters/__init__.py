@@ -7,6 +7,7 @@ canonical view the watchdog engine needs:
   - last_turn_tool_activity(ev) -> (int, set[str])  (tool calls in current turn)
   - is_watchdog_inject(text) -> bool          (our own auto-continue?)
   - enabled(ev, state, marker) -> bool        (is watchdog active here?)
+  - checkpoint_metadata(ev) -> dict           (normalized turn snapshot)
 """
 from .codex import CodexAdapter
 from .claude import ClaudeAdapter

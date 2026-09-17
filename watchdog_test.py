@@ -308,15 +308,37 @@ def main():
         cp = json.load(f)
     check("checkpoint continue_count", cp.get("continue_count"), wd.CHECKPOINT_EVERY)
 
-    # ---- metrics derived from event log ----
-    wd.update_metrics()
+    # ---- metrics derived from the event log (written by the hook itself) ----
     with open(wd.METRICS_FILE) as f:
         m = json.load(f)
-    check("metrics total_continues > 0", m.get("total_continues", 0) > 0, True)
-    check("metrics has stop_reason_distribution", "stop_reason_distribution" in m, True)
-    check("metrics has stalled_recovered", "stalled_recovered" in m, True)
-    check("metrics has completed_then_continued", "completed_then_continued" in m, True)
-    check("metrics has blocked_then_continued", "blocked_then_continued" in m, True)
+    check("metrics has totals", "totals" in m, True)
+    check("metrics totals.continues > 0", m["totals"].get("continues", 0) > 0, True)
+    check("metrics has stop_reason_distribution",
+          "stop_reason_distribution" in m["totals"], True)
+    check("metrics has stalled_recovered", "stalled_recovered" in m["totals"], True)
+    check("metrics has completed_then_continued",
+          "completed_then_continued" in m["totals"], True)
+    check("metrics has blocked_then_continued",
+          "blocked_then_continued" in m["totals"], True)
+    check("metrics tracks per-session rows", len(m.get("sessions") or {}) > 1, True)
+    check("session slice reports COMPLETED", m["sessions"]["v11-done"]["completed"], 1)
+
+    # ---- metrics stay per-session (no cross-session averaging surprises) ----
+    m_sess = wd.session_metrics("v11-done")
+    check("session_metrics is scoped", m_sess.get("completed_count"), 1)
+    check("session_metrics does not see other sessions",
+          m_sess.get("continues", 0) >= 0 and "blocked_count" not in m_sess, True)
+
+    # ---- checkpoint carries adapter metadata (checkpoint_metadata is wired) ----
+    with open(os.path.join(wd.CHECKPOINT_DIR, "v11-done.json")) as f:
+        cp_done = json.load(f)
+    check("checkpoint has tool_calls from adapter", "tool_calls" in cp_done, True)
+    check("checkpoint has completion_signal from adapter",
+          "completion_signal" in cp_done, True)
+    check("checkpoint records declared completion",
+          cp_done.get("completion_signal"), True)
+    check("checkpoint records tool names from adapter",
+          isinstance(cp_done.get("tool_names"), list), True)
 
     # ---- restore state dir ----
     wd.STATE_DIR = _old_state_dir
@@ -325,6 +347,115 @@ def main():
     wd.CHECKPOINT_DIR = _old_cp
     import shutil as _sh
     _sh.rmtree(_tmp, ignore_errors=True)
+
+    # ================= False-positive / robustness regressions =================
+    # Progress narration must NOT be read as a completion declaration; these all
+    # used to stop the watchdog mid-task because DECL_DONE matched a prefix.
+    for i, narration in enumerate([
+        "已完成初步分析,下面开始实现",
+        "已完成 3/7 个文件,还剩 4 个,继续",
+        "任务完成度约 60%,继续推进",
+        "第一步已完成,马上进入第二步",
+    ]):
+        r = run_main([turn_start(), tool_call()], narration, sid=f"fp{i}")
+        check(f"narration keeps working: {narration[:14]!r}", r.get("decision"), "block")
+
+    # Real declarations still stop (line of their own, with or without detail).
+    for i, decl in enumerate(["任务完成", "『任务完成』", "Task Complete.",
+                              "任务完成:所有改动已提交并推送。", "task is done"]):
+        r = run_main([turn_start(), tool_call()], decl, sid=f"decl{i}")
+        check(f"declaration still stops: {decl[:14]!r}", r.get("continue"), True)
+
+    # ---- transcript is parsed once per hook invocation (row cache) ----
+    import watchdog_protocol as _proto  # noqa: F401
+    from adapters.base import _ROW_CACHE
+    from adapters.codex import CodexAdapter
+    _ROW_CACHE.clear()
+    _real_parse = CodexAdapter._parse
+    _calls = {"n": 0}
+
+    def _counting_parse(path, n=600):
+        _calls["n"] += 1
+        return _real_parse(path, n)
+
+    CodexAdapter._parse = staticmethod(_counting_parse)
+    r = run_main([turn_start(), tool_call()], "继续干活", sid="cache1")
+    CodexAdapter._parse = staticmethod(_real_parse)
+    check("transcript parsed once per hook call (<=2)", _calls["n"] <= 2, True)
+    _ROW_CACHE.clear()
+
+    # ---- invalid env values must never crash the hook ----
+    for name, bad in (("CODEX_WATCHDOG_CHECKPOINT", "abc"), ("CODEX_WATCHDOG_MAX", ""),
+                      ("CODEX_WATCHDOG_QUIET", "0"), ("CODEX_WATCHDOG_RESET", "nope")):
+        os.environ[name] = bad
+        try:
+            import importlib.util as _iu
+            _spec = _iu.spec_from_file_location("wd_envtest", WD)
+            _mod = _iu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            got = "ok"
+        except Exception as exc:  # pragma: no cover
+            got = f"{type(exc).__name__}"
+        finally:
+            del os.environ[name]
+        check(f"invalid {name}={bad!r} tolerated", got, "ok")
+
+    # ---- host block cap bounds the effective burst budget ----
+    default_cap = wd.HOST_BLOCK_CAP
+    wd.HOST_BLOCK_CAP = 8
+    r = run_main([turn_start(), tool_call()], "继续干活", sid="cap1",
+                 seed={"count": 8, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True})
+    check("host block cap stops before our larger budget", r.get("continue"), True)
+    wd.HOST_BLOCK_CAP = default_cap
+
+    # ---- stale state is cleaned up ----
+    import tempfile as _tf2
+    _tmp2 = _tf2.mkdtemp(prefix="wd-clean-")
+    _saved = (wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR)
+    wd.STATE_DIR = _tmp2
+    wd.EVENTS_FILE = os.path.join(_tmp2, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmp2, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmp2, "checkpoints")
+    old_stale = os.path.join(_tmp2, "stale-session.json")
+    with open(old_stale, "w") as f:
+        f.write("{}")
+    os.utime(old_stale, (0, 0))
+    wd.cleanup_stale_state()
+    check("stale session state removed", os.path.exists(old_stale), False)
+
+    # ---- cleanup must never delete the event log, metrics, or rotated log ----
+    for _n in ("events.jsonl", "metrics.json", "events.jsonl.1"):
+        _p = os.path.join(_tmp2, _n)
+        with open(_p, "w") as f:
+            f.write("{}")
+        os.utime(_p, (0, 0))
+    os.makedirs(wd.CHECKPOINT_DIR, exist_ok=True)
+    old_cp = os.path.join(wd.CHECKPOINT_DIR, "old.json")
+    with open(old_cp, "w") as f:
+        f.write("{}")
+    os.utime(old_cp, (0, 0))
+    wd.cleanup_stale_state()
+    check("cleanup keeps events.jsonl", os.path.exists(os.path.join(_tmp2, "events.jsonl")), True)
+    check("cleanup keeps metrics.json", os.path.exists(os.path.join(_tmp2, "metrics.json")), True)
+    check("cleanup keeps rotated events log",
+          os.path.exists(os.path.join(_tmp2, "events.jsonl.1")), True)
+    check("cleanup removes stale checkpoint", os.path.exists(old_cp), False)
+
+    wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _saved
+    _sh.rmtree(_tmp2, ignore_errors=True)
+
+    # ---- event log rotation keeps the file bounded ----
+    _tmp3 = _tf2.mkdtemp(prefix="wd-rot-")
+    _saved3 = (wd.EVENTS_FILE, wd.EVENTS_MAX_BYTES)
+    wd.EVENTS_FILE = os.path.join(_tmp3, "events.jsonl")
+    wd.EVENTS_MAX_BYTES = 200
+    for i in range(10):
+        wd.emit_event("rot", "continue", wd.RUNNING, "x" * 50, i)
+    rotated = os.path.exists(wd.EVENTS_FILE + ".1")
+    check("event log rotates when oversized", rotated, True)
+    wd.EVENTS_FILE, wd.EVENTS_MAX_BYTES = _saved3
+    _sh.rmtree(_tmp3, ignore_errors=True)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):

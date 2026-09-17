@@ -37,6 +37,11 @@ A Codex **Stop hook** runs after every turn. `watchdog.py` reads the situation a
 | 60 auto-continues in a row with no real user input | **Stop** (burst guard) |
 | Idle > 30 minutes | Reset burst budget |
 
+A declaration only counts when it forms a line of its own (optionally followed by
+punctuation and a short explanation). Progress narration such as
+`已完成 3/7 个文件,还剩 4 个` or `任务完成度约 60%,继续推进` is **not** read as
+"done" — the watchdog keeps that turn going.
+
 ### Install
 
 ```bash
@@ -57,8 +62,8 @@ enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 ### Verify
 
 ```bash
-python3 watchdog_test.py    # 38 regression tests
-python3 adapters_test.py    # adapter tests
+python3 watchdog_test.py    # 68 regression tests
+python3 adapters_test.py    # 38 adapter tests
 tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
 ```
 
@@ -78,6 +83,19 @@ bash install.sh --uninstall
 | `CODEX_WATCHDOG_QUIET` | `3` | Consecutive tool-less turns before spinning detection |
 | `CODEX_WATCHDOG_CHECKPOINT` | `5` | Continues between checkpoints |
 | `CODEX_WATCHDOG_STATE_DIR` | `/tmp/codex-watchdog` | Override state/event/checkpoint/metrics root |
+| `CODEX_WATCHDOG_LOG` | `/tmp/codex-watchdog.log` | Override the plain-text log path |
+| `CODEX_WATCHDOG_EVENTS_MAX` | `2000000` | Rotate `events.jsonl` once it exceeds this many bytes |
+| `CODEX_WATCHDOG_TTL` | `604800` | Seconds before idle session state/checkpoints are cleaned up |
+| `CODEX_WATCHDOG_HOST_CAP` | `8` on Claude, `0` on Codex | Consecutive blocks the host tolerates before it overrides the hook |
+
+Invalid or out-of-range values are ignored (with a message on stderr) rather than
+crashing the hook — a typo in a config value must never break your agent's turn.
+
+**About `CODEX_WATCHDOG_HOST_CAP`:** Claude Code ends the turn itself after 8
+consecutive `decision:"block"` responses (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`,
+default 8), so a budget larger than 8 is simply unreachable there and the
+watchdog stops at the real ceiling instead. Codex has no equivalent host cap, so
+the value defaults to `0` (disabled) and `CODEX_WATCHDOG_MAX` is the only limit.
 
 ### State & Logs
 
@@ -111,9 +129,15 @@ stats) written to `checkpoints/<session_id>.json` on every state change and ever
 `CODEX_WATCHDOG_CHECKPOINT` (default 5) continues. It does **not** store the full
 transcript or generate LLM summaries.
 
-**Metrics** — `metrics.json` aggregates the event log: total continues, average
+**Metrics** — `metrics.json` is derived from the event log and split two ways: a
+per-session row and a `totals` roll-up. Reported: total continues, average
 continue rounds, stop-reason distribution, quiet-turn hits, and recovery counters
 (`stalled_recovered`, `completed_then_continued`, `blocked_then_continued`).
+
+**Bounded by design** — the event log rotates to `events.jsonl.1` once it exceeds
+`CODEX_WATCHDOG_EVENTS_MAX`, and session state plus checkpoints idle for longer
+than `CODEX_WATCHDOG_TTL` are cleaned up (at most once an hour). State files are
+written atomically, so a crash can't corrupt the burst budget.
 
 ### Cross-agent compatibility
 
