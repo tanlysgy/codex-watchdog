@@ -168,6 +168,25 @@ class ClaudeAdapter(BaseAdapter):
                 last = text
         return last
 
+    def first_user_prompt(self, ev: dict):
+        for o in self._rows(ev.get("transcript_path")):
+            role = self._entry_role(o)
+            text = self._entry_text(o)
+            if (role == "user" and text and not self.is_noise(text)
+                    and not self.is_watchdog_inject(text)):
+                return text
+        return None
+
+    def last_assistant_text(self, ev: dict):
+        last = None
+        for o in self._rows(ev.get("transcript_path")):
+            if self._entry_role(o) != "assistant":
+                continue
+            text = self._entry_text(o).strip()
+            if text:
+                last = text
+        return last
+
     def last_turn_tool_activity(self, ev: dict):
         rows = self._rows(ev.get("transcript_path"), 400)
         if not rows:

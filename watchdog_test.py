@@ -54,24 +54,39 @@ def tool_call(name="exec_command"):
     }
 
 
+def assistant_msg(text):
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    }
+
+
 def turn_start():
     return {"type": "turn_context", "payload": {"turn_id": "t1"}}
 
 
-def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False):
+def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False,
+             stop_hook_active=False, event="Stop", extra=None, raw=False):
     tp = tempfile.mktemp(suffix=".jsonl")
     with open(tp, "w") as f:
         for line in transcript:
             f.write(json.dumps(line) + "\n")
     ev = {
         "session_id": sid,
-        "hook_event_name": "Stop",
+        "hook_event_name": event,
         "transcript_path": tp,
         "cwd": "/tmp",
         "last_assistant_message": last_msg,
         "permission_mode": "default",
-        "stop_hook_active": True,
+        # Realistic default: the first Stop of a turn is not yet a continuation.
+        "stop_hook_active": stop_hook_active,
     }
+    if extra:
+        ev.update(extra)
     sp = os.path.join(wd.STATE_DIR, f"{sid}.json")
     if seed is None:
         seed = {"count": 0, "last_continue_at": None, "last_msg": None,
@@ -91,6 +106,8 @@ def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False):
             os.remove(sp)
         except OSError:
             pass
+    if raw:
+        return res
     return json.loads(res) if res else {}
 
 
@@ -456,6 +473,101 @@ def main():
     check("event log rotates when oversized", rotated, True)
     wd.EVENTS_FILE, wd.EVENTS_MAX_BYTES = _saved3
     _sh.rmtree(_tmp3, ignore_errors=True)
+
+    # ================= Resume Engine: PreCompact / SessionStart =================
+    _tmp4 = _tf2.mkdtemp(prefix="wd-resume-")
+    _saved4 = (wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR)
+    wd.STATE_DIR = _tmp4
+    wd.EVENTS_FILE = os.path.join(_tmp4, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmp4, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmp4, "checkpoints")
+
+    resume_transcript = [user_msg("把 README 的对比表更新一下"), turn_start(),
+                        assistant_msg("改完表格,接着验证链接"), tool_call()]
+
+    # A normal turn first, so the session exists with counters.
+    run_main(resume_transcript, "改完表格,接着验证链接", sid="res1", keep_state=True)
+    st = wd.load_state("res1")
+
+    # ---- PreCompact writes a resume checkpoint (and prints nothing) ----
+    r = run_main(resume_transcript, "", sid="res1", event="PreCompact",
+                 extra={"trigger": "auto"})
+    check("PreCompact emits no stdout (nothing to decide)", r, {})
+    cp_path = os.path.join(wd.CHECKPOINT_DIR, "res1.json")
+    with open(cp_path) as f:
+        cp = json.load(f)
+    check("precompact checkpoint flagged for resume", cp.get("for_resume"), True)
+    check("precompact checkpoint records trigger", cp.get("trigger"), "auto")
+    check("precompact checkpoint records goal from first prompt",
+          cp.get("goal"), "把 README 的对比表更新一下")
+    check("precompact checkpoint records next step",
+          cp.get("next_step"), "改完表格,接着验证链接")
+    check("precompact event emitted",
+          any(e.get("event") == "precompact" for e in wd.read_events("res1")), True)
+
+    # ---- SessionStart(source=compact) re-injects the resume context ----
+    r = run_main(resume_transcript, "", sid="res1", event="SessionStart",
+                 extra={"source": "compact"}, raw=True)
+    # SessionStart prints plain text (the documented context carrier), not JSON.
+    check("SessionStart injects the goal", "把 README 的对比表更新一下" in r, True)
+    check("SessionStart injects the next step", "改完表格,接着验证链接" in r, True)
+    check("SessionStart tells the agent not to restart", "restart" in r.lower(), True)
+    check("SessionStart does not emit JSON", r.startswith("{"), False)
+
+    # ---- the resume pointer is consumed: a second SessionStart stays quiet ----
+    r2 = run_main(resume_transcript, "", sid="res1", event="SessionStart",
+                  extra={"source": "compact"}, raw=True)
+    check("resume pointer consumed after one injection", r2, "")
+
+    # ---- a non-compact SessionStart (plain resume) does not replay it ----
+    run_main(resume_transcript, "又推进了一步", sid="res2", keep_state=True)
+    run_main(resume_transcript, "", sid="res2", event="PreCompact",
+             extra={"trigger": "auto"})
+    r3 = run_main(resume_transcript, "", sid="res2", event="SessionStart",
+                  extra={"source": "resume"}, raw=True)
+    check("plain resume does not replay compact context", r3, "")
+
+    # ---- SessionStart with nothing to resume stays silent ----
+    r4 = run_main(resume_transcript, "", sid="res3", event="SessionStart",
+                  extra={"source": "startup"}, raw=True)
+    check("startup with no checkpoint stays silent", r4, "")
+
+    # ---- compaction + resume are counted in metrics ----
+    m2 = json.load(open(wd.METRICS_FILE))["sessions"]["res1"]
+    check("session metrics count compactions", m2.get("compactions", 0) >= 1, True)
+    check("session metrics count resumes", m2.get("resumes", 0), 1)
+    check("resume event emitted",
+          any(e.get("event") == "resume" for e in wd.read_events("res1")), True)
+
+    wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _saved4
+    _sh.rmtree(_tmp4, ignore_errors=True)
+
+    # ================= stop_hook_active is a signal, not a stop =================
+    # A host-declared continuation must NOT end auto-continue after round one.
+    r = run_main([turn_start(), tool_call()], "继续干活", sid="hsa1",
+                 stop_hook_active=True,
+                 seed={"count": 3, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True}, keep_state=True)
+    check("host continuation does not stop auto-continue", r.get("decision"), "block")
+    st = wd.load_state("hsa1")
+    check("host continuation is recorded", st.get("host_continued"), True)
+
+    # Drift check: host says we already continued, but our counter was lost.
+    r = run_main([turn_start(), tool_call()], "继续干活", sid="hsa2",
+                 stop_hook_active=True,
+                 seed={"count": 0, "last_continue_at": None, "last_msg": None,
+                       "quiet_turns": 0, "activated": True}, keep_state=True)
+    st = wd.load_state("hsa2")
+    check("lost counter is re-synced from host signal", st.get("count", 0) >= 1, True)
+
+    m3 = json.load(open(wd.METRICS_FILE))["sessions"]["hsa1"]
+    check("host_continuations counted", m3.get("host_continuations", 0) >= 1, True)
+
+    for _sid in ("hsa1", "hsa2"):
+        try:
+            os.remove(os.path.join(wd.STATE_DIR, f"{_sid}.json"))
+        except OSError:
+            pass
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):

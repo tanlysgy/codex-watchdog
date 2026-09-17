@@ -62,8 +62,8 @@ enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 ### Verify
 
 ```bash
-python3 watchdog_test.py    # 68 regression tests
-python3 adapters_test.py    # 38 adapter tests
+python3 watchdog_test.py    # 88 regression tests
+python3 adapters_test.py    # 46 adapter tests
 tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
 ```
 
@@ -121,8 +121,9 @@ backward-compatible with existing installs.
 | `STALLED` | No progress: burst exhausted, repeated final message, or too many quiet turns |
 
 **Event Log** — a JSONL stream at `events.jsonl` with one line per transition:
-`task_started`, `continue`, `blocked`, `completed`, `stalled`. Each event carries
-`timestamp`, `session_id`, `state`, `reason`, and `continue_count`.
+`task_started`, `continue`, `blocked`, `completed`, `stalled`, plus the
+context-lifecycle `precompact` and `resume`. Each event carries `timestamp`,
+`session_id`, `state`, `reason`, and `continue_count`.
 
 **Checkpoint** — a lightweight snapshot (last message, state, counters, tool
 stats) written to `checkpoints/<session_id>.json` on every state change and every
@@ -131,13 +132,48 @@ transcript or generate LLM summaries.
 
 **Metrics** — `metrics.json` is derived from the event log and split two ways: a
 per-session row and a `totals` roll-up. Reported: total continues, average
-continue rounds, stop-reason distribution, quiet-turn hits, and recovery counters
-(`stalled_recovered`, `completed_then_continued`, `blocked_then_continued`).
+continue rounds, stop-reason distribution, quiet-turn hits, recovery counters
+(`stalled_recovered`, `completed_then_continued`, `blocked_then_continued`), and
+run-lifecycle counts (`compactions`, `resumes`, `host_continuations`).
 
 **Bounded by design** — the event log rotates to `events.jsonl.1` once it exceeds
 `CODEX_WATCHDOG_EVENTS_MAX`, and session state plus checkpoints idle for longer
 than `CODEX_WATCHDOG_TTL` are cleaned up (at most once an hour). State files are
 written atomically, so a crash can't corrupt the burst budget.
+
+### Resume engine: surviving context compaction
+
+A long auto-continued task eventually hits the context window. Nothing inside a
+Stop hook can read how full the window is — context usage is not part of the hook
+contract — but both Codex and Claude Code expose the compaction events, so the
+watchdog treats "context almost full" as an **event**, not a number:
+
+| Hook | What the watchdog does |
+|---|---|
+| `PreCompact` | Writes a checkpoint holding the task goal (the session's first real user prompt) and the next step, plus current state and counters |
+| `SessionStart` (`source: compact`) | Prints that checkpoint back as context, so the post-compaction agent resumes instead of restarting |
+
+Example of what gets re-injected:
+
+```
+[watchdog] This session was compacted mid-task. Resume it:
+- goal: 把 README 的对比表更新一下
+- next step: 改完表格,接着验证链接
+- recorded status: RUNNING (auto-continues so far: 3)
+Continue from the next step instead of restarting. ...
+```
+
+The pointer is consumed after one injection and is **not** replayed on a plain
+`resume` or `startup` SessionStart, so stale instructions don't leak into a later
+session.
+
+`install.sh` registers all three events (`Stop`, `PreCompact`, `SessionStart`) and
+is idempotent — upgrading a Stop-only install adds the new events and leaves the
+existing entry alone. Re-run `bash install.sh`, then re-trust via `/hooks`.
+
+This is deliberately not a full resume engine: it re-injects the goal and next
+step, not a reconstruction of the work. Recovering the work itself has to come
+from a checkpoint the agent writes, not from something a hook can infer.
 
 ### Cross-agent compatibility
 
@@ -149,8 +185,9 @@ transcript parsing lives in `adapters/` and is selected via `CODEX_WATCHDOG_ADAP
 | Codex | `adapters/codex.py` (default) | `bash install.sh` |
 | Claude Code | `adapters/claude.py` | `bash install.sh --agent claude` |
 
-- **Codex**: registered as a `Stop` command hook in `~/.codex/hooks.json`.
-- **Claude Code**: registered as a `Stop` command hook in `~/.claude/settings.json`
+- **Codex**: registered as `Stop`, `PreCompact` and `SessionStart` command hooks in
+  `~/.codex/hooks.json`.
+- **Claude Code**: registered as the same three events in `~/.claude/settings.json`
   (see [docs/CLAUDE.md](docs/CLAUDE.md)). Claude's Stop hook shares the same JSON
   contract: `decision:"block"` + `reason` keeps it working.
 - **Gemini CLI**: `PreToolUse` / `PostToolUse` hooks available; a Stop-equivalent event

@@ -66,8 +66,8 @@ bash install.sh
 ### 验证
 
 ```bash
-python3 watchdog_test.py    # 回归测试(68 项)
-python3 adapters_test.py    # adapter 测试(38 项)
+python3 watchdog_test.py    # 回归测试(88 项)
+python3 adapters_test.py    # adapter 测试(46 项)
 tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 ```
 
@@ -105,13 +105,40 @@ bash install.sh --uninstall
 `STALLED`),并写入结构化事件流与检查点:
 
 - 事件流:`/tmp/codex-watchdog/events.jsonl`(`task_started` / `continue` / `blocked` /
-  `completed` / `stalled`)
+  `completed` / `stalled` / `precompact` / `resume`)
 - 检查点:`/tmp/codex-watchdog/checkpoints/<session_id>.json`
 - 指标:`/tmp/codex-watchdog/metrics.json`(按会话 + 总计,增量聚合)
 
 运行时有界,不会无限增长:事件流超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)会轮转;
 空闲超过 `CODEX_WATCHDOG_TTL`(默认 7 天)的会话状态与检查点会被清理;状态文件原子写入,
 崩溃不会破坏续推预算。环境变量写错(非法值、空串、越界)只会退回默认值,不会让 hook 崩溃。
+
+### 上下文压缩后自动续接(Resume Engine)
+
+长任务最终会撞上上下文窗口。Stop hook 里读不到窗口占用,但两个宿主都暴露了压缩事件,
+所以看门狗把「上下文快满了」当作**事件**处理:
+
+| 事件 | 做什么 |
+|---|---|
+| `PreCompact` | 写检查点:目标(会话第一条真实用户消息)+ 下一步 + 状态计数 |
+| `SessionStart(source=compact)` | 把该检查点作为上下文打印回会话,压缩后接着做而不是重来 |
+
+注入示例:
+
+```
+[watchdog] This session was compacted mid-task. Resume it:
+- goal: 把 README 的对比表更新一下
+- next step: 改完表格,接着验证链接
+- recorded status: RUNNING (auto-continues so far: 3)
+Continue from the next step instead of restarting. ...
+```
+
+恢复指向只生效一次,普通 `resume`/`startup` 不会重放,避免过期指令污染后续会话。
+`bash install.sh` 会同时注册 `Stop` / `PreCompact` / `SessionStart`,并且是幂等的:
+只装过 Stop 的老安装重跑一次即可补上新事件,已有条目不会被改动。
+
+这刻意不是完整 resume:注入的是目标与下一步,不是工作内容的摘要。恢复工作内容得由 agent
+自己写进检查点,而不是由 hook 推断。
 
 **注意宿主上限**:Claude Code 在连续 8 次 `decision:"block"` 后会自己结束回合
 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),所以在其上默认取 `min(60, 8)`;Codex 没有这个上限,

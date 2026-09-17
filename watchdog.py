@@ -212,6 +212,24 @@ def last_turn_tool_activity(ev: dict):
     return ADAPTER.last_turn_tool_activity(ev)
 
 
+def first_user_prompt(ev: dict):
+    if ADAPTER is None or not hasattr(ADAPTER, "first_user_prompt"):
+        return None
+    return ADAPTER.first_user_prompt(ev)
+
+
+def last_assistant_text(ev: dict):
+    """Transcript fallback for the last assistant message.
+
+    The Stop hook is handed `last_assistant_message` directly, but
+    context-lifecycle events (PreCompact) may not carry it, and a checkpoint
+    written at compaction time is worthless without "where were we".
+    """
+    if ADAPTER is None or not hasattr(ADAPTER, "last_assistant_text"):
+        return None
+    return ADAPTER.last_assistant_text(ev)
+
+
 def turn_metadata(ev: dict) -> dict:
     """Normalized turn snapshot from the active adapter (checkpoint metadata)."""
     if ADAPTER is None or not hasattr(ADAPTER, "checkpoint_metadata"):
@@ -308,6 +326,10 @@ def fold_metric(m: dict, event: str, reason: str) -> None:
         m[key] = m.get(key, 0) + 1
         if event == "stalled" and "quiet" in (reason or "").lower():
             m["quiet_turn_hits"] = m.get("quiet_turn_hits", 0) + 1
+    elif event == "precompact":
+        m["compactions"] = m.get("compactions", 0) + 1
+    elif event == "resume":
+        m["resumes"] = m.get("resumes", 0) + 1
     prev = m.get("last_event")
     if event == "continue":
         if prev == "stalled":
@@ -353,6 +375,9 @@ def update_metrics(sid: str, metrics: dict) -> None:
         "stalled_recovered": metrics.get("stalled_recovered", 0),
         "completed_then_continued": metrics.get("completed_then_continued", 0),
         "blocked_then_continued": metrics.get("blocked_then_continued", 0),
+        "compactions": metrics.get("compactions", 0),
+        "resumes": metrics.get("resumes", 0),
+        "host_continuations": metrics.get("host_continuations", 0),
         "last_event": metrics.get("last_event"),
         "updated_at": time.strftime("%F %T"),
     }
@@ -374,6 +399,10 @@ def update_metrics(sid: str, metrics: dict) -> None:
             s.get("completed_then_continued", 0) for s in sessions.values()),
         "blocked_then_continued": sum(
             s.get("blocked_then_continued", 0) for s in sessions.values()),
+        "compactions": sum(s.get("compactions", 0) for s in sessions.values()),
+        "resumes": sum(s.get("resumes", 0) for s in sessions.values()),
+        "host_continuations": sum(
+            s.get("host_continuations", 0) for s in sessions.values()),
     }
     doc["updated_at"] = time.strftime("%F %T")
     try:
@@ -387,7 +416,8 @@ def update_metrics(sid: str, metrics: dict) -> None:
 # --- Lightweight Checkpoint -------------------------------------------------
 
 def write_checkpoint(sid: str, state: dict, msg: str, fc_count: int,
-                     fc_names: set, reason: str, metadata: dict = None) -> None:
+                     fc_names: set, reason: str, metadata: dict = None,
+                     extra: dict = None) -> None:
     """Snapshot the turn so a later run (or a human) can resume from it."""
     md = metadata if metadata is not None else {}
     tool_calls = md.get("tool_calls", fc_count)
@@ -406,6 +436,8 @@ def write_checkpoint(sid: str, state: dict, msg: str, fc_count: int,
         "need_user_signal": md.get("need_user_signal"),
         "reason": reason,
     }
+    if extra:
+        cp.update(extra)
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     path = os.path.join(CHECKPOINT_DIR, f"{sid}.json")
     try:
@@ -413,6 +445,135 @@ def write_checkpoint(sid: str, state: dict, msg: str, fc_count: int,
             json.dump(cp, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+# --- Resume Engine: checkpoints across compaction ---------------------------
+#
+# Nothing inside a Stop hook can read how full the context window is (context
+# usage is not in the hook contract; repeated feature requests were closed as
+# not planned). The supported primitives are event-driven instead: PreCompact
+# fires before the window is summarised away, and SessionStart(source=compact)
+# fires afterwards. So we treat "context almost full" as an *event*, not a
+# number:
+#
+#   PreCompact      -> write a checkpoint holding the goal + next step + state
+#   SessionStart    -> re-inject that checkpoint as context, so the post-compact
+#                      agent still knows what it was doing
+
+def load_checkpoint(sid: str):
+    path = os.path.join(CHECKPOINT_DIR, f"{sid}.json")
+    try:
+        with open(path) as f:
+            cp = json.load(f)
+        return cp if isinstance(cp, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_precompact_checkpoint(ev: dict, sid: str) -> None:
+    """Save a resume pointer before the host summarises the context away.
+
+    Unlike a Stop-time checkpoint (a snapshot of a finished turn), this one is
+    written while the turn is still alive, and carries the goal and next step so
+    a post-compaction session can pick the work back up.
+    """
+    state = load_state(sid)
+    msg = (ev.get("last_assistant_message") or "").strip()
+    if not msg:
+        # PreCompact need not carry the message; fall back to the transcript.
+        msg = (last_assistant_text(ev) or "").strip()
+    fc_count, fc_names = last_turn_tool_activity(ev)
+    metadata = turn_metadata(ev)
+    metrics = session_metrics(sid)
+    # The session's first real user prompt is the best available statement of
+    # what the task actually is, so keep it as the resume "goal".
+    goal = state.get("goal")
+    if not goal:
+        prompt = first_user_prompt(ev)
+        if prompt:
+            goal = prompt.strip()[:500]
+            state["goal"] = goal
+    state["next_step"] = (msg or state.get("last_msg") or "").strip()[:500]
+    # NOTE: don't bump `compactions` here — emit_event folds it into metrics.
+    emit_event(sid, "precompact", state.get("status") or RUNNING,
+               f"compaction ({ev.get('trigger') or 'unknown'})",
+               state.get("count", 0), metrics)
+    write_checkpoint(
+        sid, state, msg or state.get("last_msg") or "", fc_count, fc_names,
+        f"precompact ({ev.get('trigger') or 'unknown'})", metadata,
+        extra={
+            "trigger": ev.get("trigger"),
+            "goal": goal,
+            "next_step": state.get("next_step"),
+            "compactions": metrics.get("compactions", 0),
+            "for_resume": True,
+        },
+    )
+    save_state(sid, state)
+    update_metrics(sid, metrics)
+    log(f"{sid} checkpoint written before compaction ({ev.get('trigger')})")
+
+
+def resume_context(ev: dict, sid: str) -> str:
+    """Build the context to re-inject after a compaction ('' = nothing to say)."""
+    cp = load_checkpoint(sid)
+    if not cp or not cp.get("for_resume"):
+        return ""
+    parts = ["[watchdog] This session was compacted mid-task. Resume it:"]
+    if cp.get("goal"):
+        parts.append(f"- goal: {cp['goal']}")
+    if cp.get("next_step"):
+        parts.append(f"- next step: {cp['next_step']}")
+    if cp.get("last_message"):
+        parts.append(f"- last progress note: {cp['last_message'][:400]}")
+    parts.append(
+        f"- recorded status: {cp.get('status')} "
+        f"(auto-continues so far: {cp.get('continue_count', 0)})"
+    )
+    parts.append(
+        "Continue from the next step instead of restarting. Work that already "
+        "succeeded does not need to be redone; re-check anything whose result "
+        "you cannot see any more. Say 『Task Complete』 when it is really done, "
+        "or 『Need User』 if you are blocked on the user."
+    )
+    return "\n".join(parts)
+
+
+def emit_resume_context(ev: dict, sid: str) -> None:
+    """SessionStart hook: re-inject the pre-compaction checkpoint as context.
+
+    Plain stdout is the documented carrier for context-only events on both
+    hosts, so we print it rather than describing a hookSpecificOutput shape we
+    would have to guess at.
+    """
+    state = load_state(sid)
+    if not session_activated(ev, state):
+        return
+    cp = load_checkpoint(sid)
+    source = ev.get("source")
+    # Only inject when there is a resume pointer, and only once per compaction:
+    # a later plain `resume`/`startup` must not replay stale instructions.
+    if not cp or not cp.get("for_resume"):
+        return
+    if source not in (None, "", "compact"):
+        return
+    text = resume_context(ev, sid)
+    if not text:
+        return
+    metrics = session_metrics(sid)
+    emit_event(sid, "resume", state.get("status") or RUNNING,
+               f"context re-injected after {source or 'start'}", state.get("count", 0),
+               metrics)
+    update_metrics(sid, metrics)
+    # Consume the pointer so the next SessionStart does not repeat it.
+    cp["for_resume"] = False
+    try:
+        with open(os.path.join(CHECKPOINT_DIR, f"{sid}.json"), "w") as f:
+            json.dump(cp, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    log(f"{sid} resume context emitted (source={source})")
+    print(text)
 
 
 # --- Housekeeping -----------------------------------------------------------
@@ -506,9 +667,16 @@ def main() -> None:
         return
     hook_event = ev.get("hook_event_name") or ev.get("hookEventName") or ""
     # Accept both Codex ("Stop") and Claude Code ("Stop") event names.
-    if hook_event not in ("Stop", "ClaudeCodeStop"):
-        return
+    if hook_event in ("Stop", "ClaudeCodeStop"):
+        return handle_stop(ev)
+    # Context-lifecycle events: the only supported way to survive a compaction.
+    if hook_event == "PreCompact":
+        return write_precompact_checkpoint(ev, ev.get("session_id") or "unknown")
+    if hook_event == "SessionStart":
+        return emit_resume_context(ev, ev.get("session_id") or "unknown")
 
+
+def handle_stop(ev: dict) -> None:
     sid = ev.get("session_id") or "unknown"
     msg = (ev.get("last_assistant_message") or "").strip()
     state = load_state(sid)
@@ -524,6 +692,12 @@ def main() -> None:
     fc_count, fc_names = last_turn_tool_activity(ev)
     metadata = turn_metadata(ev)
     metrics = session_metrics(sid)
+
+    # Host signals: `stop_hook_active` is true when this turn is already a
+    # continuation produced by a previous block. Claude Code gives up after 8
+    # consecutive blocks; Codex has no cap of its own and relies on the hook to
+    # bound itself, so our own budget stays the primary guard there.
+    host_continued = bool(ev.get("stop_hook_active"))
 
     # First time we see this session -> record task_started.
     if state.get("status") is None:
@@ -550,6 +724,24 @@ def main() -> None:
             reason = f"host block cap reached ({HOST_BLOCK_CAP})"
         return stop(sid, state, STALLED, reason, msg,
                     fc_count, fc_names, metrics, metadata)
+
+    # Note on `stop_hook_active`: it is true when this turn is already a
+    # continuation produced by a previous block. Blocking again is exactly how
+    # repeated continuations work, so it is deliberately NOT a stop condition —
+    # treating it as one would end auto-continue after the very first round.
+    # It is used two ways instead:
+    #   1. as a drift check — if the host says we already continued but our own
+    #      counter is 0, our state was lost (TTL cleanup, wiped state dir), and
+    #      continuing blindly would sail past the host's block cap unnoticed;
+    #   2. as a recorded signal, so `host_continuations` distinguishes rounds the
+    #      host carried from rounds we initiated.
+    state["host_continued"] = host_continued
+    if host_continued:
+        metrics["host_continuations"] = metrics.get("host_continuations", 0) + 1
+        if state.get("count", 0) == 0:
+            log(f"{sid} host reports an active continuation but our counter is 0; "
+                f"re-syncing budget")
+            state["count"] = 1
 
     # ---- 3. repeated final message ----
     if state.get("last_msg") and msg and msg == state["last_msg"]:

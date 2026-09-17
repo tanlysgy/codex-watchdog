@@ -38,6 +38,22 @@ class BaseAdapter:
         """Return the text of the most recent real user message, or None."""
         raise NotImplementedError
 
+    def first_user_prompt(self, ev: dict):
+        """Return the text of the session's first real user message, or None.
+
+        Used as the task "goal" when a checkpoint is written for resume.
+        """
+        return None
+
+    def last_assistant_text(self, ev: dict):
+        """Return the transcript's last assistant message, or None.
+
+        Context-lifecycle events (PreCompact) may arrive without the
+        `last_assistant_message` field the Stop hook carries, so the transcript
+        is the fallback source for "where were we".
+        """
+        return None
+
     def last_turn_tool_activity(self, ev: dict):
         """Return (count, set_of_tool_names) for the current turn."""
         raise NotImplementedError

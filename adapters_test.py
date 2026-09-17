@@ -151,6 +151,44 @@ base = BaseAdapter()
 md4 = base.checkpoint_metadata({"session_id": "s-meta4", "last_assistant_message": "hi"})
 check("base: metadata default tool_calls", md4.get("tool_calls"), 0)
 check("base: metadata default completion_signal", md4.get("completion_signal"), False)
+check("base: metadata default first_user_prompt", base.first_user_prompt({}), None)
+check("base: metadata default last_assistant_text", base.last_assistant_text({}), None)
+
+# ---- resume helpers: first user prompt / last assistant text ----
+def codex_assistant(text):
+    return {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]}}
+
+
+p_first = write_tmp([
+    {"type": "response_item", "payload": {"type": "message", "role": "user",
+     "content": [{"type": "input_text", "text": "<environment_context>"}]}},
+    codex_user("把 README 的对比表更新一下"),
+    codex_user("再补一个例子"),
+    {"type": "turn_context", "payload": {}},
+    codex_assistant("第一步做完了,继续第二步"),
+])
+check("codex: first_user_prompt is the goal",
+      codex.first_user_prompt({"transcript_path": p_first}), "把 README 的对比表更新一下")
+check("codex: last_user_prompt is the latest",
+      codex.last_user_prompt({"transcript_path": p_first}), "再补一个例子")
+check("codex: last_assistant_text",
+      codex.last_assistant_text({"transcript_path": p_first}), "第一步做完了,继续第二步")
+check("codex: first_user_prompt skips watchdog injects",
+      codex.first_user_prompt({"transcript_path": write_tmp([
+          codex_user("[watchdog] 任务尚未完成,请继续"),
+          codex_user("真正的任务"),
+      ])}), "真正的任务")
+
+p_cl_first = write_tmp([
+    claude_user("重构 adapter 层"),
+    {"type": "assistant", "message": {"role": "assistant",
+     "content": [{"type": "text", "text": "重构完成一半,继续"}]}},
+])
+check("claude: first_user_prompt", claude.first_user_prompt({"transcript_path": p_cl_first}),
+      "重构 adapter 层")
+check("claude: last_assistant_text",
+      claude.last_assistant_text({"transcript_path": p_cl_first}), "重构完成一半,继续")
 
 # ---- both adapters must agree with the shared protocol (no vocabulary drift) ----
 import watchdog_protocol as _p  # noqa: E402
@@ -194,7 +232,8 @@ CodexAdapter._parse = staticmethod(_real)
 check("three questions, one parse", _calls["n"], 1)
 _ROW_CACHE.clear()
 
-for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb, _empty, p_cache):
+for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb, _empty, p_cache,
+          p_first, p_cl_first):
     try:
         os.remove(p)
     except OSError:

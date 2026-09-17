@@ -2,7 +2,23 @@
 
 ## 触发链
 
-Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin 读 JSON)→ 脚本决定返回 `{"decision":"block","reason":...}`(续推)或 `{"continue":true}`(停)。
+看门狗注册三个 hook 事件,共用同一个入口 `watchdog.py`(从 stdin 读 JSON):
+
+| 事件 | 作用 | 输出 |
+|---|---|---|
+| `Stop` | 回合结束,判断继续还是停 | `{"decision":"block","reason":...}` 续推 / `{"continue":true}` 停 |
+| `PreCompact` | 上下文即将被压缩,落检查点 | 无(不需要决策) |
+| `SessionStart` | 压缩后重新会话,注入恢复上下文 | 纯文本 stdout(上下文类事件的官方载体) |
+
+```
+turn ends ──> Stop ──> continue? ──> yes ──> block, keep going
+                          │
+                          └── no ──> turn ends
+                                        │
+context fills ──> PreCompact ──> checkpoint(goal + next step)
+                                        │
+                             SessionStart(source=compact) ──> inject context ──> resume
+```
 
 ## 决策顺序(优先级从高到低)
 
@@ -18,6 +34,20 @@ Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin �
 6. **安静回合**:连续 `CODEX_WATCHDOG_QUIET`(3)轮无工具调用 → 停(打转)。
 7. **经典完成词**:安静回合 + 命中完成短语(`全部完成`/`all done`...) → 停。
 8. 其余 → 继续推,并重置安静计数。
+
+## 关于 `stop_hook_active`
+
+两个宿主都会在 Stop 输入里传 `stop_hook_active`:当这次 Stop **本身**是由上一次 block
+产生的续推时,它为 true。
+
+它**不是**停止条件 —— 它恰好说明「上一轮续推生效了」,如果据此停止,自动续推在第一轮就会结束。
+它的两个真实用途:
+
+1. **漂移检测**:宿主说已经在续推,而我们的计数是 0(状态被 TTL 清理、状态目录被清空),
+   说明计数丢了。此时按宿主信号把计数同步到 ≥1,避免不知不觉越过宿主的 block 上限。
+2. **信号记录**:计入 `host_continuations`,区分「宿主接管的轮次」和「我们主动发起的轮次」。
+
+宿主上限由 `CODEX_WATCHDOG_HOST_CAP` 处理,不由这个字段触发停止。
 
 ## 声明协议为什么要独占一行
 
@@ -36,7 +66,7 @@ Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin �
 
 ## 状态与日志
 
-- `/tmp/codex-watchdog/<session_id>.json` — 每个会话的 `count / last_continue_at / last_msg / quiet_turns / activated / status / updated_at / reason`
+- `/tmp/codex-watchdog/<session_id>.json` — 每个会话的 `count / last_continue_at / last_msg / quiet_turns / activated / status / updated_at / reason / goal / next_step / host_continued`
 - `/tmp/codex-watchdog.log` — 追加式日志,记录每次决策
 - `/tmp/codex-watchdog/events.jsonl` — 结构化事件流(JSONL)
 - `/tmp/codex-watchdog/checkpoints/<session_id>.json` — 轻量检查点
@@ -63,7 +93,8 @@ Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin �
 `events.jsonl` 每行一个事件,字段:`timestamp / session_id / event / state / reason / continue_count`
 (`timestamp` 为 Unix 秒,便于机器处理;人类可读时间在检查点与日志里)。
 
-事件类型:`task_started`、`continue`、`blocked`、`completed`、`stalled`。
+事件类型:`task_started`、`continue`、`blocked`、`completed`、`stalled`,
+以及上下文生命周期事件 `precompact`、`resume`。
 会话首次出现时写 `task_started`;每次续推写 `continue`;每次进入终态写对应事件。
 
 ### 轻量检查点(Checkpoint)
@@ -74,11 +105,38 @@ Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin �
 - 当前 TaskState
 - continue 次数
 - quiet_turns
-- 最近工具统计(tool_calls / tool_names)
+- 最近工具统计(tool_calls / tool_names,来自 adapter 的 `checkpoint_metadata`)
 - 决策原因
 
 触发条件:每次状态变化立即保存;每 `CODEX_WATCHDOG_CHECKPOINT`(默认 5)次续推保存一次。
 不保存完整 transcript,不生成 LLM 摘要。
+
+### Resume Engine:跨越上下文压缩
+
+长任务最终会撞上上下文窗口。**Stop hook 里读不到窗口占用**——上下文用量不在 hook 契约里
+(相关功能请求被官方关闭为 not planned)。但两个宿主都暴露了压缩事件,所以看门狗把
+「上下文快满了」当作**事件**而不是数字:
+
+| 事件 | 做什么 |
+|---|---|
+| `PreCompact` | 写检查点:`goal`(取会话第一条真实用户消息)+ `next_step`(当前进度)+ 状态与计数,并标记 `for_resume: true` |
+| `SessionStart(source=compact)` | 把该检查点作为上下文打印回会话,让压缩后的 agent 接着做而不是从头做 |
+
+设计要点:
+
+- **`goal` 取第一条真实用户 prompt**,因为那是「任务是什么」最可靠的表述。
+  它一旦写入状态就保留,后续压缩不会覆盖。
+- **`next_step` 优先用 hook 的 `last_assistant_message`**;`PreCompact` 不一定带这个字段,
+  此时回退到读 transcript(adapter 的 `last_assistant_text`),否则检查点里
+  「我们进行到哪了」会是空的。
+- **指向性的一次性**:注入后把 `for_resume` 置为 false。普通 `resume`/`startup` 的
+  `SessionStart` 不重放,避免过期指令污染后续会话。
+- **输出用纯文本 stdout**,因为这是官方文档里上下文类事件(Claude 的
+  `UserPromptSubmit`/`SessionStart`、Codex 的 `SessionStart` 等)的载体;
+  避免去猜 `hookSpecificOutput` 的确切结构。
+
+边界:它注入的是**目标与下一步**,不是工作内容的摘要。真正恢复工作内容必须由 agent
+自己写进检查点,而不是由 hook 去推断。
 
 ### 指标(Metrics)
 
@@ -90,9 +148,11 @@ Codex 每回合结束会触发 `Stop` hook → 执行 `watchdog.py`(从 stdin �
 - `stalled_recovered` — STALLED 后恢复续推次数
 - `completed_then_continued` — COMPLETED 后又续推次数
 - `blocked_then_continued` — BLOCKED 后又续推次数
+- `compactions` / `resumes` — 压缩与恢复次数
+- `host_continuations` — 宿主报告「已在续推」的轮次
 
 聚合是**增量**的:每个事件只更新当前会话的计数器(O(1)),再合并进全局文件。
-早期版本在每次 `emit_event()` 里重读重解析整个 `events.jsonl`(O(n²)),而且把
+早期版本在每次 `emit_event()` 里重读重解析整个 `events.jsonl`(O(n2)),而且把
 不同会话混在一起平均,现在两者都已修正。
 
 ### 有界性(Bounded state)
@@ -119,18 +179,21 @@ hook 崩溃会直接破坏用户的一次回合,这比配置写错严重得多�
 
 ## Adapter 扩展点
 
-`BaseAdapter` 提供 `checkpoint_metadata(ev)` 返回标准化快照:
+`BaseAdapter` 提供:
 
-- `session_id`
-- `final_message`
-- `tool_calls` / `tool_names`
-- `completion_signal` / `need_user_signal`
+| 方法 | 用途 |
+|---|---|
+| `checkpoint_metadata(ev)` | 标准化回合快照:`session_id` / `final_message` / `tool_calls` / `tool_names` / `completion_signal` / `need_user_signal` |
+| `first_user_prompt(ev)` | 会话第一条真实用户消息,作为 resume 的 `goal` |
+| `last_assistant_text(ev)` | transcript 里的最后一条 assistant 消息,`PreCompact` 缺字段时的回退 |
 
-引擎在每次 Stop hook 里调用它,结果直接写进检查点(`write_checkpoint`),
+引擎在每次 Stop hook 里调用 `checkpoint_metadata`,结果直接写进检查点,
 所以检查点里的 `tool_calls`/`completion_signal` 就是 adapter 视角的真实值。
-`codex.py` 与 `claude.py` 均已实现;自定义 adapter 只需实现该方法。
+`codex.py` 与 `claude.py` 均已实现;自定义 adapter 只需实现这些方法。
 
 两个 adapter 都从 `watchdog_protocol.py` 取声明判定,因此**不会**与引擎分叉。
+transcript 在单次进程内只解析一次(`adapters/base.py` 的 `cached_rows`),
+三个问题共享同一份已解析行,较小的窗口从较大窗口切片得到。
 
 ## 可移植性
 

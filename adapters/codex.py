@@ -55,6 +55,17 @@ class CodexAdapter(BaseAdapter):
             c.get("text", "") for c in (p.get("content") or []) if isinstance(c, dict)
         ).strip()
 
+    @staticmethod
+    def _assistant_text(o) -> str:
+        p = o.get("payload") or {}
+        if o.get("type") != "response_item" or p.get("type") != "message":
+            return ""
+        if p.get("role") != "assistant":
+            return ""
+        return "".join(
+            c.get("text", "") for c in (p.get("content") or []) if isinstance(c, dict)
+        ).strip()
+
     def is_noise(self, text: str) -> bool:
         t = text.strip()
         if not t:
@@ -66,6 +77,21 @@ class CodexAdapter(BaseAdapter):
         for o in self._rows(ev.get("transcript_path")):
             text = self._user_text(o)
             if text and not self.is_noise(text):
+                last = text
+        return last
+
+    def first_user_prompt(self, ev: dict):
+        for o in self._rows(ev.get("transcript_path")):
+            text = self._user_text(o)
+            if text and not self.is_noise(text) and not self.is_watchdog_inject(text):
+                return text
+        return None
+
+    def last_assistant_text(self, ev: dict):
+        last = None
+        for o in self._rows(ev.get("transcript_path")):
+            text = self._assistant_text(o)
+            if text:
                 last = text
         return last
 

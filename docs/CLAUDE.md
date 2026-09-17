@@ -20,7 +20,13 @@ touch ~/.claude/watchdog.enabled
 
 ## 2. 注册 hook
 
-编辑 `~/.claude/settings.json`,加入:
+推荐直接用安装脚本(会同时注册 Stop、PreCompact、SessionStart,并跳过已存在的条目):
+
+```bash
+bash install.sh --agent=claude
+```
+
+手动配置的话,编辑 `~/.claude/settings.json`,加入:
 
 ```json
 {
@@ -35,17 +41,49 @@ touch ~/.claude/watchdog.enabled
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CODEX_WATCHDOG_ADAPTER=claude python3 ~/.claude/watchdog.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CODEX_WATCHDOG_ADAPTER=claude python3 ~/.claude/watchdog.py",
+            "timeout": 30
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-或者在项目级 `.claude/settings.json` 中配置(只对当前项目生效)。
+`PreCompact` 与 `SessionStart` 用于上下文压缩前后的检查点与恢复:
+压缩前把目标/下一步落盘,压缩后把这份信息重新注入,避免长任务在自动压缩后丢失上下文。
+两者都不改变原有 Stop 行为,可以只保留 Stop 事件。
 
 > 注意:Claude Code 的 hook 配置里命令通过 shell 执行,环境变量前缀写法在大多数
 > shell 下可用。若你的 shell 不认 `KEY=val cmd`,请写成
 > `python3 ~/.claude/watchdog.py` 并在脚本里设默认,或在 `settings.json` 的同级
 > `.env`/shell profile 中 export `CODEX_WATCHDOG_ADAPTER=claude`。
+
+## 2b. 关于 Claude 的 8 次连续 block 上限
+
+Claude Code 在连续 8 次 `decision:"block"` 后会自己结束回合
+(`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`,默认 8,可设为 0 关闭)。看门狗据此把
+`CODEX_WATCHDOG_HOST_CAP` 在 Claude 下默认设为 8,实际预算取 `min(CODEX_WATCHDOG_MAX, 8)`,
+并在日志里记录 `host block cap reached (8)`,让这个上限可见而不是静默失效。
+如果你的任务确实需要更多轮,同时调大两边的值即可。
 
 ## 3. 信任/权限
 
@@ -84,6 +122,6 @@ Claude Code 的真实转录与 Codex 有两点差异,adapter 已处理:
 ## 卸载
 
 ```bash
-rm -rf ~/.claude/watchdog.py ~/.claude/adapters ~/.claude/watchdog.enabled
-# 并从 settings.json 移除 Stop 的 hook 条目
+rm -rf ~/.claude/watchdog.py ~/.claude/watchdog_protocol.py ~/.claude/adapters ~/.claude/watchdog.enabled
+# 并从 settings.json 移除 Stop / PreCompact / SessionStart 的 watchdog 条目
 ```
