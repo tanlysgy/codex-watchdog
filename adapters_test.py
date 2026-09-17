@@ -119,7 +119,40 @@ with open(p6, "w") as f:
     json.dump([claude_user("数组格式"), claude_tool_use("Bash")], f)
 check("claude: array transcript user", claude.last_user_prompt({"transcript_path": p6}), "数组格式")
 
-for p in (p1, p2, p3, p4, p5, p6, p_aux, p_fb):
+# ---- Runtime v1.1: checkpoint_metadata normalization ----
+# codex
+p7 = write_tmp([codex_user("继续"), {"type": "turn_context", "payload": {}},
+                codex_fc("exec_command")])
+md = codex.checkpoint_metadata({"session_id": "s-meta", "transcript_path": p7,
+                                "last_assistant_message": "任务完成:全部搞定"})
+check("codex: metadata session_id", md.get("session_id"), "s-meta")
+check("codex: metadata final_message", md.get("final_message"), "任务完成:全部搞定")
+check("codex: metadata tool_calls", md.get("tool_calls"), 1)
+check("codex: metadata tool_names", md.get("tool_names"), ["exec_command"])
+check("codex: metadata completion_signal", md.get("completion_signal"), True)
+check("codex: metadata need_user_signal", md.get("need_user_signal"), False)
+
+md2 = codex.checkpoint_metadata({"session_id": "s-meta2", "transcript_path": p7,
+                                 "last_assistant_message": "需要用户:请提供凭据"})
+check("codex: metadata need_user_signal true", md2.get("need_user_signal"), True)
+check("codex: metadata completion_signal false", md2.get("completion_signal"), False)
+
+# claude
+p8 = write_tmp([claude_user("继续"), claude_tool_use("Bash")])
+md3 = claude.checkpoint_metadata({"session_id": "s-meta3", "transcript_path": p8,
+                                  "last_assistant_message": "Task Complete."})
+check("claude: metadata session_id", md3.get("session_id"), "s-meta3")
+check("claude: metadata tool_calls", md3.get("tool_calls"), 1)
+check("claude: metadata completion_signal", md3.get("completion_signal"), True)
+
+# base default (no adapter-specific parsing)
+from adapters.base import BaseAdapter  # noqa: E402
+base = BaseAdapter()
+md4 = base.checkpoint_metadata({"session_id": "s-meta4", "last_assistant_message": "hi"})
+check("base: metadata default tool_calls", md4.get("tool_calls"), 0)
+check("base: metadata default completion_signal", md4.get("completion_signal"), False)
+
+for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb):
     try:
         os.remove(p)
     except OSError:

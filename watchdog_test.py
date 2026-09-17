@@ -239,6 +239,93 @@ def main():
     check("reason follows zh session", "任务尚未完成" in (r_zh.get("reason") or ""), True)
     check("reason follows en session", "The task is not finished" in (r_en.get("reason") or ""), True)
 
+    # ================= Runtime v1.1: TaskState / Event Log / Checkpoint / Metrics =================
+    # Use an isolated state dir so we don't pollute /tmp/codex-watchdog.
+    import tempfile as _tf
+    _tmp = _tf.mkdtemp(prefix="wd-test-")
+    _old_state_dir = wd.STATE_DIR
+    _old_events = wd.EVENTS_FILE
+    _old_metrics = wd.METRICS_FILE
+    _old_cp = wd.CHECKPOINT_DIR
+    wd.STATE_DIR = _tmp
+    wd.EVENTS_FILE = os.path.join(_tmp, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmp, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmp, "checkpoints")
+
+    def run_v11(last_msg, sid, seed=None, transcript=None):
+        return run_main(transcript or [turn_start()], last_msg, sid=sid, seed=seed,
+                        keep_state=True)
+
+    # ---- task_started emitted on first sight of a session ----
+    run_v11("继续干活", "v11-start")
+    evs = wd.read_events()
+    check("task_started event emitted", any(e.get("event") == "task_started" for e in evs), True)
+
+    # ---- continue -> RUNNING state persisted ----
+    run_v11("继续干活", "v11-run")
+    st = wd.load_state("v11-run")
+    check("continue sets status RUNNING", st.get("status"), wd.RUNNING)
+    check("continue sets updated_at", st.get("updated_at") is not None, True)
+
+    # ---- declared done -> COMPLETED ----
+    run_v11("任务完成:全部搞定", "v11-done")
+    st = wd.load_state("v11-done")
+    check("declared done -> COMPLETED", st.get("status"), wd.COMPLETED)
+    evs = wd.read_events()
+    check("completed event emitted", any(e.get("event") == "completed" for e in evs), True)
+
+    # ---- declared need-user -> BLOCKED ----
+    run_v11("需要用户:请提供 API key", "v11-blocked")
+    st = wd.load_state("v11-blocked")
+    check("declared need-user -> BLOCKED", st.get("status"), wd.BLOCKED)
+    evs = wd.read_events()
+    check("blocked event emitted", any(e.get("event") == "blocked" for e in evs), True)
+
+    # ---- repeated message -> STALLED ----
+    seed_rep = {"count": 1, "last_continue_at": None, "last_msg": "同一个消息",
+                "quiet_turns": 0, "activated": True}
+    run_v11("同一个消息", "v11-stall", seed=seed_rep)
+    st = wd.load_state("v11-stall")
+    check("repeated message -> STALLED", st.get("status"), wd.STALLED)
+    evs = wd.read_events()
+    check("stalled event emitted", any(e.get("event") == "stalled" for e in evs), True)
+
+    # ---- checkpoint written on state change (stop paths) ----
+    cp_path = os.path.join(wd.CHECKPOINT_DIR, "v11-done.json")
+    check("checkpoint file created on state change", os.path.exists(cp_path), True)
+    with open(cp_path) as f:
+        cp = json.load(f)
+    check("checkpoint has status", cp.get("status"), wd.COMPLETED)
+    check("checkpoint has last_message", cp.get("last_message"), "任务完成:全部搞定")
+
+    # ---- checkpoint written every CHECKPOINT_EVERY continues ----
+    seed_cp = {"count": wd.CHECKPOINT_EVERY - 1, "last_continue_at": None,
+               "last_msg": None, "quiet_turns": 0, "activated": True}
+    run_v11("继续干活", "v11-cp", seed=seed_cp)
+    cp_path = os.path.join(wd.CHECKPOINT_DIR, "v11-cp.json")
+    check("checkpoint written at continue multiple", os.path.exists(cp_path), True)
+    with open(cp_path) as f:
+        cp = json.load(f)
+    check("checkpoint continue_count", cp.get("continue_count"), wd.CHECKPOINT_EVERY)
+
+    # ---- metrics derived from event log ----
+    wd.update_metrics()
+    with open(wd.METRICS_FILE) as f:
+        m = json.load(f)
+    check("metrics total_continues > 0", m.get("total_continues", 0) > 0, True)
+    check("metrics has stop_reason_distribution", "stop_reason_distribution" in m, True)
+    check("metrics has stalled_recovered", "stalled_recovered" in m, True)
+    check("metrics has completed_then_continued", "completed_then_continued" in m, True)
+    check("metrics has blocked_then_continued", "blocked_then_continued" in m, True)
+
+    # ---- restore state dir ----
+    wd.STATE_DIR = _old_state_dir
+    wd.EVENTS_FILE = _old_events
+    wd.METRICS_FILE = _old_metrics
+    wd.CHECKPOINT_DIR = _old_cp
+    import shutil as _sh
+    _sh.rmtree(_tmp, ignore_errors=True)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
         os.makedirs(os.path.dirname(ENABLED), exist_ok=True)

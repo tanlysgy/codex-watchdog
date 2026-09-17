@@ -57,7 +57,7 @@ enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 ### Verify
 
 ```bash
-python3 watchdog_test.py    # 11 regression tests
+python3 watchdog_test.py    # 38 regression tests
 python3 adapters_test.py    # adapter tests
 tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
 ```
@@ -76,11 +76,44 @@ bash install.sh --uninstall
 | `CODEX_WATCHDOG_MAX` | `60` | Burst auto-continue limit |
 | `CODEX_WATCHDOG_RESET` | `1800` | Idle seconds before budget reset |
 | `CODEX_WATCHDOG_QUIET` | `3` | Consecutive tool-less turns before spinning detection |
+| `CODEX_WATCHDOG_CHECKPOINT` | `5` | Continues between checkpoints |
+| `CODEX_WATCHDOG_STATE_DIR` | `/tmp/codex-watchdog` | Override state/event/checkpoint/metrics root |
 
 ### State & Logs
 
 - State: `/tmp/codex-watchdog/<session_id>.json`
 - Log: `/tmp/codex-watchdog.log`
+- Event log (JSONL): `/tmp/codex-watchdog/events.jsonl`
+- Checkpoints: `/tmp/codex-watchdog/checkpoints/<session_id>.json`
+- Metrics: `/tmp/codex-watchdog/metrics.json`
+
+### Runtime v1.1: TaskState, Event Log, Checkpoint, Metrics
+
+The watchdog tracks a lightweight **task state machine** per session and records
+observability artifacts — all optional, zero new dependencies, and fully
+backward-compatible with existing installs.
+
+**TaskState** — every session carries a `status` in its state file:
+
+| State | Meaning |
+|---|---|
+| `RUNNING` | Task is progressing (auto-continue active) |
+| `BLOCKED` | Waiting on the user (declared `需要用户`/`Need User`, or a genuine need-user request) |
+| `COMPLETED` | Task finished (declared `任务完成`/`Task Complete`, or done phrase on a quiet turn) |
+| `STALLED` | No progress: burst exhausted, repeated final message, or too many quiet turns |
+
+**Event Log** — a JSONL stream at `events.jsonl` with one line per transition:
+`task_started`, `continue`, `blocked`, `completed`, `stalled`. Each event carries
+`timestamp`, `session_id`, `state`, `reason`, and `continue_count`.
+
+**Checkpoint** — a lightweight snapshot (last message, state, counters, tool
+stats) written to `checkpoints/<session_id>.json` on every state change and every
+`CODEX_WATCHDOG_CHECKPOINT` (default 5) continues. It does **not** store the full
+transcript or generate LLM summaries.
+
+**Metrics** — `metrics.json` aggregates the event log: total continues, average
+continue rounds, stop-reason distribution, quiet-turn hits, and recovery counters
+(`stalled_recovered`, `completed_then_continued`, `blocked_then_continued`).
 
 ### Cross-agent compatibility
 

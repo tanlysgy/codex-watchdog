@@ -23,6 +23,17 @@ Evidence-driven finish detection:
   6. Quiet turns: 3 tool-less turns in a row -> stop (spinning).
   7. Classic done phrases (on a quiet turn) -> stop.
 
+Runtime v1.1 observability (all optional, zero new dependencies):
+  - TaskState: every session carries a status (RUNNING / BLOCKED / COMPLETED /
+    STALLED) persisted in the session state file.
+  - Event Log: a JSONL stream of task_started / continue / blocked / completed /
+    stalled events at /tmp/codex-watchdog/events.jsonl.
+  - Checkpoint: a lightweight snapshot (last message, state, counters) written
+    every N continues and on every state change, under
+    /tmp/codex-watchdog/checkpoints/.
+  - Metrics: aggregates derived from the event log at
+    /tmp/codex-watchdog/metrics.json.
+
 State: /tmp/codex-watchdog/<session_id>.json
 Log:   /tmp/codex-watchdog.log
 """
@@ -39,12 +50,22 @@ if _HERE not in sys.path:
 
 from adapters import load_adapter  # noqa: E402
 
-STATE_DIR = "/tmp/codex-watchdog"
-LOG_FILE = "/tmp/codex-watchdog.log"
+STATE_DIR = os.environ.get("CODEX_WATCHDOG_STATE_DIR", "/tmp/codex-watchdog")
+LOG_FILE = os.environ.get("CODEX_WATCHDOG_LOG", "/tmp/codex-watchdog.log")
+EVENTS_FILE = os.path.join(STATE_DIR, "events.jsonl")
+METRICS_FILE = os.path.join(STATE_DIR, "metrics.json")
+CHECKPOINT_DIR = os.path.join(STATE_DIR, "checkpoints")
 BURST_MAX = int(os.environ.get("CODEX_WATCHDOG_MAX", "60"))
 RESET_AFTER_SEC = float(os.environ.get("CODEX_WATCHDOG_RESET", "1800"))
 QUIET_TURNS_MAX = int(os.environ.get("CODEX_WATCHDOG_QUIET", "3"))
+CHECKPOINT_EVERY = int(os.environ.get("CODEX_WATCHDOG_CHECKPOINT", "5"))
 ADAPTER_NAME = os.environ.get("CODEX_WATCHDOG_ADAPTER", "codex")
+
+# --- TaskState ---
+RUNNING = "RUNNING"
+BLOCKED = "BLOCKED"
+COMPLETED = "COMPLETED"
+STALLED = "STALLED"
 
 try:
     ADAPTER = load_adapter(ADAPTER_NAME)
@@ -187,6 +208,148 @@ def should_reset_burst(state: dict, ev: dict) -> bool:
     return False
 
 
+# --- Structured Event Log (JSONL) ---
+
+def read_events() -> list:
+    events = []
+    try:
+        with open(EVENTS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return events
+
+
+def emit_event(sid: str, event: str, status: str, reason: str,
+               continue_count: int) -> None:
+    ev = {
+        "timestamp": time.strftime("%F %T"),
+        "session_id": sid,
+        "event": event,
+        "state": status,
+        "reason": reason,
+        "continue_count": continue_count,
+    }
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(EVENTS_FILE, "a") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    update_metrics()
+
+
+# --- Metrics (derived from the event log) ---
+
+def update_metrics() -> None:
+    events = read_events()
+    total_continues = sum(1 for e in events if e.get("event") == "continue")
+    sessions = {e.get("session_id") for e in events if e.get("event") == "continue"}
+    avg = round(total_continues / len(sessions), 2) if sessions else 0
+
+    stop_dist = {}
+    for e in events:
+        if e.get("event") in ("completed", "blocked", "stalled"):
+            stop_dist[e["event"]] = stop_dist.get(e["event"], 0) + 1
+
+    quiet_turn_hits = sum(
+        1 for e in events
+        if e.get("event") == "stalled" and "quiet" in (e.get("reason") or "").lower()
+    )
+
+    stalled_recovered = completed_then_continued = blocked_then_continued = 0
+    by_sid = {}
+    for e in events:
+        by_sid.setdefault(e.get("session_id"), []).append(e)
+    for seq in by_sid.values():
+        prev = None
+        for e in seq:
+            if e.get("event") == "continue":
+                if prev == "stalled":
+                    stalled_recovered += 1
+                elif prev == "completed":
+                    completed_then_continued += 1
+                elif prev == "blocked":
+                    blocked_then_continued += 1
+            prev = e.get("event")
+
+    metrics = {
+        "total_continues": total_continues,
+        "average_continue_rounds": avg,
+        "stop_reason_distribution": stop_dist,
+        "quiet_turn_hits": quiet_turn_hits,
+        "stalled_recovered": stalled_recovered,
+        "completed_then_continued": completed_then_continued,
+        "blocked_then_continued": blocked_then_continued,
+        "updated_at": time.strftime("%F %T"),
+    }
+    try:
+        with open(METRICS_FILE, "w") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# --- Lightweight Checkpoint ---
+
+def write_checkpoint(sid: str, state: dict, msg: str, fc_count: int,
+                     fc_names: set, reason: str) -> None:
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    cp = {
+        "timestamp": time.strftime("%F %T"),
+        "session_id": sid,
+        "status": state.get("status"),
+        "continue_count": state.get("count", 0),
+        "quiet_turns": state.get("quiet_turns", 0),
+        "last_message": msg,
+        "tool_calls": fc_count,
+        "tool_names": sorted(fc_names),
+        "reason": reason,
+    }
+    try:
+        with open(os.path.join(CHECKPOINT_DIR, f"{sid}.json"), "w") as f:
+            json.dump(cp, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# --- Terminal / continue transitions ---
+
+def stop(sid: str, state: dict, status: str, reason: str, msg: str,
+         fc_count: int, fc_names: set) -> None:
+    state["status"] = status
+    state["updated_at"] = now()
+    state["reason"] = reason
+    emit_event(sid, status.lower(), status, reason, state.get("count", 0))
+    write_checkpoint(sid, state, msg, fc_count, fc_names, reason)
+    save_state(sid, state)
+    log(f"{sid} {status}: {reason}")
+    print(json.dumps({"continue": True}))
+
+
+def keep_going(sid: str, state: dict, msg: str, fc_count: int, fc_names: set,
+               reason: str) -> None:
+    state["count"] = state.get("count", 0) + 1
+    state["last_continue_at"] = now()
+    state["last_msg"] = msg
+    state["status"] = RUNNING
+    state["updated_at"] = now()
+    state["reason"] = reason
+    emit_event(sid, "continue", RUNNING, reason, state["count"])
+    if state["count"] % CHECKPOINT_EVERY == 0:
+        write_checkpoint(sid, state, msg, fc_count, fc_names, reason)
+    save_state(sid, state)
+    log(f"{sid} continue #{state['count']} (tools={fc_count}): {msg[:60]!r}")
+    print(json.dumps({"decision": "block", "reason": reason}))
+
+
 def main() -> None:
     try:
         ev = json.load(sys.stdin)
@@ -209,48 +372,36 @@ def main() -> None:
         state["count"] = 0
         state["last_msg"] = None
 
+    fc_count, fc_names = last_turn_tool_activity(ev)
+
+    # First time we see this session -> record task_started.
+    if state.get("status") is None:
+        state["status"] = RUNNING
+        emit_event(sid, "task_started", RUNNING, "session started", 0)
+
     # ---- 1. declared protocol (highest priority) ----
     if DECL_DONE.search(msg):
-        log(f"{sid} declared done: {msg[:80]!r}; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, COMPLETED, "declared done", msg, fc_count, fc_names)
     if DECL_NEED_USER.search(msg):
-        log(f"{sid} declared need-user: {msg[:80]!r}; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, BLOCKED, "declared need-user", msg, fc_count, fc_names)
 
     # ---- 2. burst guard ----
     if state.get("count", 0) >= BURST_MAX:
-        log(f"{sid} burst exhausted ({BURST_MAX} auto-continues, no user input); stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, STALLED, "burst exhausted", msg, fc_count, fc_names)
 
     # ---- 3. repeated final message ----
     if state.get("last_msg") and msg and msg == state["last_msg"]:
-        log(f"{sid} repeated final message; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, STALLED, "repeated final message", msg, fc_count, fc_names)
 
     # ---- 4. short genuine need-user request ----
     if len(msg) <= 160 and NEED_USER.search(msg) and not RHETORICAL.search(msg):
-        log(f"{sid} needs user: {msg[:80]!r}; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, BLOCKED, "needs user", msg, fc_count, fc_names)
 
     # ---- 4b. agent offered options / asked for a decision -> stop & wait ----
     if len(msg) <= 400 and PROMPT_FOR_INPUT.search(msg):
-        log(f"{sid} prompt-for-input: {msg[:80]!r}; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, BLOCKED, "prompt-for-input", msg, fc_count, fc_names)
 
     # ---- 5. tool evidence for the just-finished turn ----
-    fc_count, fc_names = last_turn_tool_activity(ev)
     if fc_count <= 0:
         state["quiet_turns"] = state.get("quiet_turns", 0) + 1
     else:
@@ -258,23 +409,14 @@ def main() -> None:
 
     # ---- 6. fallback DONE (only stop if this was a quiet turn) ----
     if state.get("quiet_turns", 0) >= 1 and DONE.search(msg):
-        log(f"{sid} done (quiet turn + done phrase): {msg[:80]!r}; stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, COMPLETED, "done (quiet turn + done phrase)",
+                    msg, fc_count, fc_names)
 
     # ---- 7. too many quiet turns in a row -> stop (spinning) ----
     if state.get("quiet_turns", 0) >= QUIET_TURNS_MAX:
-        log(f"{sid} {QUIET_TURNS_MAX} quiet turns in a row (no tool activity); stopping")
-        save_state(sid, state)
-        print(json.dumps({"continue": True}))
-        return
+        return stop(sid, state, STALLED, "quiet turns", msg, fc_count, fc_names)
 
     # ---- 8. otherwise keep going ----
-    state["count"] = state.get("count", 0) + 1
-    state["last_continue_at"] = now()
-    state["last_msg"] = msg
-    save_state(sid, state)
     last_prompt = last_user_prompt(ev) or ""
     reason_en = (
         "[watchdog] The task is not finished; keep working on the same task and "
@@ -296,8 +438,7 @@ def main() -> None:
         reason = reason_zh
     else:
         reason = reason_en
-    log(f"{sid} continue #{state['count']} (tools={fc_count}): {msg[:60]!r}")
-    print(json.dumps({"decision": "block", "reason": reason}))
+    return keep_going(sid, state, msg, fc_count, fc_names, reason)
 
 
 if __name__ == "__main__":

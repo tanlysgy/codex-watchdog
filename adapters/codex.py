@@ -8,6 +8,7 @@
 """
 import json
 import os
+import re
 from .base import BaseAdapter
 
 NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions")
@@ -94,3 +95,25 @@ class CodexAdapter(BaseAdapter):
             if "watchdog" in text or "看门狗" in text or "没做完自己继续" in text:
                 return True
         return False
+
+    def checkpoint_metadata(self, ev: dict) -> dict:
+        fc_count, fc_names = self.last_turn_tool_activity(ev)
+        msg = (ev.get("last_assistant_message") or "").strip()
+        return {
+            "session_id": ev.get("session_id"),
+            "final_message": msg,
+            "tool_calls": fc_count,
+            "tool_names": sorted(fc_names),
+            "completion_signal": bool(
+                re.search(r"^\s*[『「【\"''“”]?\s*(任务完成|全部完成|已完成|done\.|done$|"
+                          r"task\s+(is\s+)?(complete|done)|task\s+completed|all\s+(tasks|work)\s+"
+                          r"(complete|done|finished)|fully\s+complete)",
+                          msg, re.I | re.M)
+            ),
+            "need_user_signal": bool(
+                re.search(r"^\s*[『「【\"''“”]?\s*(需要用户|需要你|need user|needs user|"
+                          r"need your input|need your decision|waiting for (your|you)|"
+                          r"blocked on (you|your|user)|awaiting (your|user)|等待用户)",
+                          msg, re.I | re.M)
+            ),
+        }
