@@ -66,7 +66,7 @@ bash install.sh
 ### 验证
 
 ```bash
-python3 watchdog_test.py    # 回归测试(88 项)
+python3 watchdog_test.py    # 回归测试(112 项)
 python3 adapters_test.py    # adapter 测试(46 项)
 tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 ```
@@ -120,7 +120,7 @@ bash install.sh --uninstall
 
 | 事件 | 做什么 |
 |---|---|
-| `PreCompact` | 写检查点:目标(会话第一条真实用户消息)+ 下一步 + 状态计数 |
+| `PreCompact` | 写检查点:目标(用户最近一次真实请求)+ 下一步 + 状态计数 |
 | `SessionStart(source=compact)` | 把该检查点作为上下文打印回会话,压缩后接着做而不是重来 |
 
 注入示例:
@@ -133,7 +133,14 @@ bash install.sh --uninstall
 Continue from the next step instead of restarting. ...
 ```
 
+目标跟着**当前**任务走,而不是会话的第一个任务:长会话里可以连续有多个请求,压缩后把旧任务
+当成目标会把 agent 赶回已经做完的工作。`[watchdog]` 注入不会被当成目标。
+
 恢复指向只生效一次,普通 `resume`/`startup` 不会重放,避免过期指令污染后续会话。
+
+所有事件(含 `PreCompact` / `SessionStart`)都遵守与 `Stop` 相同的启用开关。看门狗关闭
+或该会话从未启用时,不读 transcript、不写任何东西 —— 关闭状态下连状态目录都不会创建。
+
 `bash install.sh` 会同时注册 `Stop` / `PreCompact` / `SessionStart`,并且是幂等的:
 只装过 Stop 的老安装重跑一次即可补上新事件,已有条目不会被改动。
 

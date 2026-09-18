@@ -119,21 +119,28 @@ context fills ──> PreCompact ──> checkpoint(goal + next step)
 
 | 事件 | 做什么 |
 |---|---|
-| `PreCompact` | 写检查点:`goal`(取会话第一条真实用户消息)+ `next_step`(当前进度)+ 状态与计数,并标记 `for_resume: true` |
+| `PreCompact` | 写检查点:`goal`(用户最近一次真实请求)+ `next_step`(当前进度)+ 状态与计数,并标记 `for_resume: true` |
 | `SessionStart(source=compact)` | 把该检查点作为上下文打印回会话,让压缩后的 agent 接着做而不是从头做 |
 
 设计要点:
 
-- **`goal` 取第一条真实用户 prompt**,因为那是「任务是什么」最可靠的表述。
-  它一旦写入状态就保留,后续压缩不会覆盖。
+- **`goal` 取用户最近一次真实请求**,不是第一条。长会话可连续包含多个任务,
+  压缩后把旧任务当目标会把 agent 赶回已完成的工作。因此每次 `PreCompact` 都用
+  `last_user_prompt` 刷新(仅当与上次不同才记日志),`[watchdog]` 注入不计入。
+  首次(还没有真实用户消息)才退回 `first_user_prompt`。
 - **`next_step` 优先用 hook 的 `last_assistant_message`**;`PreCompact` 不一定带这个字段,
   此时回退到读 transcript(adapter 的 `last_assistant_text`),否则检查点里
   「我们进行到哪了」会是空的。
+- **状态不为空**:`PreCompact` 可能早于该会话的第一个 `Stop` 触发,此时状态文件里没有
+  `status`;检查点写入 `RUNNING` 作为兜底,避免恢复文本出现 `recorded status: None`。
 - **指向性的一次性**:注入后把 `for_resume` 置为 false。普通 `resume`/`startup` 的
   `SessionStart` 不重放,避免过期指令污染后续会话。
 - **输出用纯文本 stdout**,因为这是官方文档里上下文类事件(Claude 的
   `UserPromptSubmit`/`SessionStart`、Codex 的 `SessionStart` 等)的载体;
   避免去猜 `hookSpecificOutput` 的确切结构。
+- **统一启用开关**:三个事件都走 `session_activated()`。关闭或未启用的会话不读
+  transcript、不写盘,连状态目录都不创建 —— 一个被关掉的工具继续记录用户输入是不可接受的。
+  为此 `maybe_cleanup()` 在状态目录不存在时直接返回。
 
 边界:它注入的是**目标与下一步**,不是工作内容的摘要。真正恢复工作内容必须由 agent
 自己写进检查点,而不是由 hook 去推断。
@@ -150,6 +157,12 @@ context fills ──> PreCompact ──> checkpoint(goal + next step)
 - `blocked_then_continued` — BLOCKED 后又续推次数
 - `compactions` / `resumes` — 压缩与恢复次数
 - `host_continuations` — 宿主报告「已在续推」的轮次
+
+**计数必须落成事件。** 指标每次 hook 调用都从事件流重建,任何只存在内存里的计数器
+都会被重置 —— `host_continuations` 曾因此永远停在 1,改成写 `host_continue` 事件后
+才正确累加。该事件描述的是**同一轮**(前面那次 block 造成的续推),所以它不更新
+`last_event`,否则会静默破坏 `stalled_recovered` / `completed_then_continued` 这类
+依赖「上一个事件」的恢复计数。
 
 聚合是**增量**的:每个事件只更新当前会话的计数器(O(1)),再合并进全局文件。
 早期版本在每次 `emit_event()` 里重读重解析整个 `events.jsonl`(O(n2)),而且把
@@ -184,7 +197,7 @@ hook 崩溃会直接破坏用户的一次回合,这比配置写错严重得多�
 | 方法 | 用途 |
 |---|---|
 | `checkpoint_metadata(ev)` | 标准化回合快照:`session_id` / `final_message` / `tool_calls` / `tool_names` / `completion_signal` / `need_user_signal` |
-| `first_user_prompt(ev)` | 会话第一条真实用户消息,作为 resume 的 `goal` |
+| `first_user_prompt(ev)` | 会话第一条真实用户消息,仅在还没有真实用户消息时作为 `goal` 兜底 |
 | `last_assistant_text(ev)` | transcript 里的最后一条 assistant 消息,`PreCompact` 缺字段时的回退 |
 
 引擎在每次 Stop hook 里调用 `checkpoint_metadata`,结果直接写进检查点,

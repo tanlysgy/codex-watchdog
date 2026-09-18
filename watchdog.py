@@ -330,6 +330,8 @@ def fold_metric(m: dict, event: str, reason: str) -> None:
         m["compactions"] = m.get("compactions", 0) + 1
     elif event == "resume":
         m["resumes"] = m.get("resumes", 0) + 1
+    elif event == "host_continue":
+        m["host_continuations"] = m.get("host_continuations", 0) + 1
     prev = m.get("last_event")
     if event == "continue":
         if prev == "stalled":
@@ -338,7 +340,11 @@ def fold_metric(m: dict, event: str, reason: str) -> None:
             m["completed_then_continued"] = m.get("completed_then_continued", 0) + 1
         elif prev == "blocked":
             m["blocked_then_continued"] = m.get("blocked_then_continued", 0) + 1
-    m["last_event"] = event
+    # A host-continuation marker describes the *same* round as the block that
+    # preceded it, so it must not become `prev` for the next continue — that
+    # would silently break the recovery counters above.
+    if event != "host_continue":
+        m["last_event"] = event
 
 
 def session_metrics(sid: str) -> dict:
@@ -478,6 +484,11 @@ def write_precompact_checkpoint(ev: dict, sid: str) -> None:
     a post-compaction session can pick the work back up.
     """
     state = load_state(sid)
+    # Writing state and reading the transcript is exactly what a user asking for
+    # the watchdog to stay off does not want, so honour the same gate as Stop.
+    if not session_activated(ev, state):
+        return
+    state["activated"] = True
     msg = (ev.get("last_assistant_message") or "").strip()
     if not msg:
         # PreCompact need not carry the message; fall back to the transcript.
@@ -485,17 +496,27 @@ def write_precompact_checkpoint(ev: dict, sid: str) -> None:
     fc_count, fc_names = last_turn_tool_activity(ev)
     metadata = turn_metadata(ev)
     metrics = session_metrics(sid)
-    # The session's first real user prompt is the best available statement of
-    # what the task actually is, so keep it as the resume "goal".
-    goal = state.get("goal")
-    if not goal:
-        prompt = first_user_prompt(ev)
-        if prompt:
-            goal = prompt.strip()[:500]
-            state["goal"] = goal
+    # The goal is "what the user last actually asked for". Refreshing it matters:
+    # a long session can contain several tasks in a row, and re-injecting a stale
+    # goal after compaction would send the agent back to finished work.
+    prompt = last_user_prompt(ev)
+    if prompt and not is_watchdog_inject(prompt):
+        if prompt != state.get("goal_prompt"):
+            if state.get("goal_prompt"):
+                log(f"{sid} new user task; refreshing resume goal")
+            state["goal_prompt"] = prompt
+            state["goal"] = prompt.strip()[:500]
+    elif not state.get("goal"):
+        # No real user message visible yet (fresh session) -> use the transcript.
+        first = first_user_prompt(ev)
+        if first:
+            state["goal"] = first.strip()[:500]
     state["next_step"] = (msg or state.get("last_msg") or "").strip()[:500]
+    # Keep the printed status meaningful even before the first Stop of a session
+    # (a PreCompact can arrive first), without claiming a task_started we never saw.
+    status = state.get("status") or RUNNING
     # NOTE: don't bump `compactions` here — emit_event folds it into metrics.
-    emit_event(sid, "precompact", state.get("status") or RUNNING,
+    emit_event(sid, "precompact", status,
                f"compaction ({ev.get('trigger') or 'unknown'})",
                state.get("count", 0), metrics)
     write_checkpoint(
@@ -503,7 +524,8 @@ def write_precompact_checkpoint(ev: dict, sid: str) -> None:
         f"precompact ({ev.get('trigger') or 'unknown'})", metadata,
         extra={
             "trigger": ev.get("trigger"),
-            "goal": goal,
+            "status": status,
+            "goal": state.get("goal"),
             "next_step": state.get("next_step"),
             "compactions": metrics.get("compactions", 0),
             "for_resume": True,
@@ -612,7 +634,13 @@ def cleanup_stale_state() -> None:
 
 
 def maybe_cleanup() -> None:
-    """Run housekeeping at most once an hour, recorded by a stamp file."""
+    """Run housekeeping at most once an hour, recorded by a stamp file.
+
+    Skips entirely when the state dir does not exist yet, so a session the
+    watchdog is not enabled for never creates one (or any file) just by running.
+    """
+    if not os.path.isdir(STATE_DIR):
+        return
     stamp = os.path.join(STATE_DIR, ".last-cleanup")
     try:
         if os.path.getmtime(stamp) > now() - 3600:
@@ -621,7 +649,6 @@ def maybe_cleanup() -> None:
         pass
     cleanup_stale_state()
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
         with open(stamp, "w") as f:
             f.write(str(now()))
     except OSError:
@@ -733,11 +760,14 @@ def handle_stop(ev: dict) -> None:
     #   1. as a drift check — if the host says we already continued but our own
     #      counter is 0, our state was lost (TTL cleanup, wiped state dir), and
     #      continuing blindly would sail past the host's block cap unnoticed;
-    #   2. as a recorded signal, so `host_continuations` distinguishes rounds the
-    #      host carried from rounds we initiated.
+    #   2. as a recorded event, so `host_continuations` distinguishes rounds the
+    #      host carried from rounds we initiated. It has to go through the event
+    #      log: metrics are re-derived from the log on every hook call, so a
+    #      counter kept only in memory would reset to 1 forever.
     state["host_continued"] = host_continued
     if host_continued:
-        metrics["host_continuations"] = metrics.get("host_continuations", 0) + 1
+        emit_event(sid, "host_continue", state.get("status") or RUNNING,
+                   "host reports continuation active", state.get("count", 0), metrics)
         if state.get("count", 0) == 0:
             log(f"{sid} host reports an active continuation but our counter is 0; "
                 f"re-syncing budget")

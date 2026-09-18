@@ -62,7 +62,7 @@ enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 ### Verify
 
 ```bash
-python3 watchdog_test.py    # 88 regression tests
+python3 watchdog_test.py    # 112 regression tests
 python3 adapters_test.py    # 46 adapter tests
 tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
 ```
@@ -166,6 +166,16 @@ Continue from the next step instead of restarting. ...
 The pointer is consumed after one injection and is **not** replayed on a plain
 `resume` or `startup` SessionStart, so stale instructions don't leak into a later
 session.
+
+The goal tracks the **current** task, not the session's first one: a long session
+can contain several requests in a row, and refreshing the goal is what keeps a
+post-compaction agent from being sent back to work it already finished. A
+`[watchdog]` auto-continue injection never becomes the goal.
+
+Every hook — including `PreCompact` and `SessionStart` — honours the same
+enable/disable gate as `Stop`. When the watchdog is off (or the session was never
+enabled), no transcript is read and nothing is written to disk; a disabled run
+does not even create the state directory.
 
 `install.sh` registers all three events (`Stop`, `PreCompact`, `SessionStart`) and
 is idempotent — upgrading a Stop-only install adds the new events and leaves the

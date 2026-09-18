@@ -70,7 +70,8 @@ def turn_start():
 
 
 def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False,
-             stop_hook_active=False, event="Stop", extra=None, raw=False):
+             stop_hook_active=False, event="Stop", extra=None, raw=False,
+             no_seed=False):
     tp = tempfile.mktemp(suffix=".jsonl")
     with open(tp, "w") as f:
         for line in transcript:
@@ -88,10 +89,11 @@ def run_main(transcript, last_msg, seed=None, sid="sess-ev", keep_state=False,
     if extra:
         ev.update(extra)
     sp = os.path.join(wd.STATE_DIR, f"{sid}.json")
-    if seed is None:
-        seed = {"count": 0, "last_continue_at": None, "last_msg": None,
-                "quiet_turns": 0, "activated": True}
-    wd.save_state(sid, seed)
+    if not no_seed:
+        if seed is None:
+            seed = {"count": 0, "last_continue_at": None, "last_msg": None,
+                    "quiet_turns": 0, "activated": True}
+        wd.save_state(sid, seed)
     old_in, old_out = sys.stdin, sys.stdout
     sys.stdin = io.StringIO(json.dumps(ev))
     out = io.StringIO()
@@ -542,7 +544,16 @@ def main():
     wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _saved4
     _sh.rmtree(_tmp4, ignore_errors=True)
 
-    # ================= stop_hook_active is a signal, not a stop =================
+# ================= stop_hook_active is a signal, not a stop =================
+    # Isolated state dir: the metrics/event files are cumulative, so counting
+    # assertions must not share them with earlier sections (or an earlier run).
+    _tmpH = _tf2.mkdtemp(prefix="wd-host-")
+    _savedH = (wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR)
+    wd.STATE_DIR = _tmpH
+    wd.EVENTS_FILE = os.path.join(_tmpH, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmpH, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmpH, "checkpoints")
+
     # A host-declared continuation must NOT end auto-continue after round one.
     r = run_main([turn_start(), tool_call()], "继续干活", sid="hsa1",
                  stop_hook_active=True,
@@ -560,14 +571,160 @@ def main():
     st = wd.load_state("hsa2")
     check("lost counter is re-synced from host signal", st.get("count", 0) >= 1, True)
 
-    m3 = json.load(open(wd.METRICS_FILE))["sessions"]["hsa1"]
-    check("host_continuations counted", m3.get("host_continuations", 0) >= 1, True)
+    # host_continuations must accumulate across rounds (it used to saturate at 1
+    # because it was only kept in memory and metrics are re-derived each call).
+    for i in range(3):
+        run_main([turn_start(), tool_call()], f"继续第{i}轮", sid="hsa3",
+                 stop_hook_active=True, keep_state=True)
+    m3 = json.load(open(wd.METRICS_FILE))["sessions"]["hsa3"]
+    check("host_continuations accumulates (exact)", m3.get("host_continuations"), 3)
+    check("host_continue is an event, not a memory-only counter",
+          sum(1 for e in wd.read_events("hsa3") if e.get("event") == "host_continue"), 3)
+    # A host_continue marker describes the same round, so it must not clobber the
+    # recovery counters that read the previous event.
+    check("host_continue does not become last_event",
+          m3.get("last_event") != "host_continue", True)
 
-    for _sid in ("hsa1", "hsa2"):
+    # The recovery counters still work with host_continue interleaved: a stalled
+    # round followed by a host-reported continuation that we then continue past.
+    run_main([turn_start(), tool_call()], "同一句", sid="hsa4",
+             seed={"count": 1, "last_continue_at": None, "last_msg": "同一句",
+                   "quiet_turns": 0, "activated": True, "status": wd.RUNNING},
+             keep_state=True)
+    run_main([turn_start(), tool_call()], "继续", sid="hsa4",
+             stop_hook_active=True,
+             seed={"count": 1, "last_continue_at": None, "last_msg": "同一句",
+                   "quiet_turns": 0, "activated": True, "status": wd.STALLED},
+             keep_state=True)
+    m4 = json.load(open(wd.METRICS_FILE))["sessions"]["hsa4"]
+    check("stalled_recovered survives an interleaved host_continue",
+          m4.get("stalled_recovered"), 1)
+
+    wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _savedH
+    _sh.rmtree(_tmpH, ignore_errors=True)
+
+    # ================= disabled / never-enabled sessions stay untouched =========
+    # Reading a transcript and writing the user's prompt to disk is precisely what
+    # a user asking for the watchdog to stay off does not want; every event must
+    # honour the same gate, not just Stop.
+    _tmp5 = _tf2.mkdtemp(prefix="wd-gate-")
+    _saved5 = (wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR)
+    wd.STATE_DIR = _tmp5
+    wd.EVENTS_FILE = os.path.join(_tmp5, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmp5, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmp5, "checkpoints")
+
+    # No enable marker anywhere and no wake word: a session the watchdog was
+    # never turned on for. HOME is redirected so the developer's real
+    # ~/.codex/watchdog.enabled cannot leak into this check, and no state is
+    # pre-seeded (a seeded state file would itself mark the session activated).
+    _real_home = os.environ.get("HOME")
+    _fake_home = _tf2.mkdtemp(prefix="wd-home-")
+    os.environ["HOME"] = _fake_home
+    try:
+        for ev_name, extra, out_kind in (("Stop", {"last_assistant_message": "继续"}, "json"),
+                                         ("PreCompact", {"trigger": "auto"}, "raw"),
+                                         ("SessionStart", {"source": "compact"}, "raw")):
+            r = run_main([user_msg("机密任务内容"), turn_start(), tool_call()], "",
+                         sid="gate1", event=ev_name, extra=extra, keep_state=True,
+                         no_seed=True, raw=(out_kind == "raw"))
+            check(f"never-enabled {ev_name} stays silent", r, "" if out_kind == "raw" else {})
+        check("never-enabled session wrote no state",
+              os.path.exists(os.path.join(wd.STATE_DIR, "gate1.json")), False)
+        check("never-enabled session wrote no checkpoint",
+              os.path.exists(os.path.join(wd.CHECKPOINT_DIR, "gate1.json")), False)
+        check("never-enabled session wrote no events",
+              os.path.exists(wd.EVENTS_FILE), False)
+        check("never-enabled run wrote nothing into the state dir",
+              os.listdir(wd.STATE_DIR), [])
+        check("never-enabled session leaked no user prompt",
+              not os.path.exists(wd.CHECKPOINT_DIR), True)
+
+        # Explicit opt-out (CODEX_WATCHDOG=0) must gate every event too.
+        _prev_off = os.environ.get("CODEX_WATCHDOG")
+        os.environ["CODEX_WATCHDOG"] = "0"
         try:
-            os.remove(os.path.join(wd.STATE_DIR, f"{_sid}.json"))
-        except OSError:
-            pass
+            for ev_name, extra, out_kind in (("Stop", {"last_assistant_message": "继续"}, "json"),
+                                             ("PreCompact", {"trigger": "auto"}, "raw"),
+                                             ("SessionStart", {"source": "compact"}, "raw")):
+                r = run_main([user_msg("机密任务内容"), turn_start(), tool_call()], "",
+                             sid="gate2", event=ev_name, extra=extra, keep_state=True,
+                             no_seed=True, raw=(out_kind == "raw"))
+                check(f"disabled {ev_name} stays silent", r,
+                      "" if out_kind == "raw" else {})
+            check("disabled session wrote no checkpoint",
+                  os.path.exists(os.path.join(wd.CHECKPOINT_DIR, "gate2.json")), False)
+            check("disabled session wrote no events", os.path.exists(wd.EVENTS_FILE), False)
+        finally:
+            if _prev_off is None:
+                os.environ.pop("CODEX_WATCHDOG", None)
+            else:
+                os.environ["CODEX_WATCHDOG"] = _prev_off
+    finally:
+        if _real_home is not None:
+            os.environ["HOME"] = _real_home
+        _sh.rmtree(_fake_home, ignore_errors=True)
+
+    wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _saved5
+    _sh.rmtree(_tmp5, ignore_errors=True)
+
+    # ================= resume goal follows the *current* task =================
+    _tmp6 = _tf2.mkdtemp(prefix="wd-goal-")
+    _saved6 = (wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR)
+    wd.STATE_DIR = _tmp6
+    wd.EVENTS_FILE = os.path.join(_tmp6, "events.jsonl")
+    wd.METRICS_FILE = os.path.join(_tmp6, "metrics.json")
+    wd.CHECKPOINT_DIR = os.path.join(_tmp6, "checkpoints")
+
+    t_two_tasks = [user_msg("任务A:写文档"), turn_start(),
+                   assistant_msg("文档写完了,接着做B"), tool_call()]
+    run_main(t_two_tasks, "文档写完了,接着做B", sid="goal1", keep_state=True)
+    run_main(t_two_tasks, "", sid="goal1", event="PreCompact", extra={"trigger": "auto"})
+    cp_a = json.load(open(os.path.join(wd.CHECKPOINT_DIR, "goal1.json")))
+    check("goal starts as the first task", cp_a.get("goal"), "任务A:写文档")
+
+    # The user now asks for something else in the same session.
+    t_new_task = [user_msg("任务A:写文档"), turn_start(),
+                  assistant_msg("文档写完了,接着做B"), tool_call(),
+                  user_msg("任务B:把文档翻译成英文"), turn_start(),
+                  assistant_msg("开始翻译,先处理第一节"), tool_call()]
+    run_main(t_new_task, "开始翻译,先处理第一节", sid="goal1", keep_state=True)
+    run_main(t_new_task, "", sid="goal1", event="PreCompact", extra={"trigger": "auto"})
+    cp_b = json.load(open(os.path.join(wd.CHECKPOINT_DIR, "goal1.json")))
+    check("goal refreshes when the user starts a new task",
+          cp_b.get("goal"), "任务B:把文档翻译成英文")
+    check("next step follows the new task",
+          cp_b.get("next_step"), "开始翻译,先处理第一节")
+
+    # The refreshed goal is what actually gets re-injected.
+    injected = run_main(t_new_task, "", sid="goal1", event="SessionStart",
+                        extra={"source": "compact"}, raw=True)
+    check("resume injects the refreshed goal", "任务B:把文档翻译成英文" in injected, True)
+    check("resume does not resurrect the old task", "任务A:写文档" in injected, False)
+
+    # A watchdog injection is not a user task and must not become the goal.
+    t_inject = [user_msg("任务C:清理日志"), turn_start(),
+                assistant_msg("清理中"), tool_call(),
+                user_msg("[watchdog] 任务尚未完成,请继续"), turn_start(),
+                assistant_msg("继续清理"), tool_call()]
+    run_main(t_inject, "继续清理", sid="goal2", keep_state=True)
+    run_main(t_inject, "", sid="goal2", event="PreCompact", extra={"trigger": "auto"})
+    cp_c = json.load(open(os.path.join(wd.CHECKPOINT_DIR, "goal2.json")))
+    check("watchdog injection never becomes the goal", cp_c.get("goal"), "任务C:清理日志")
+
+    # ---- PreCompact before any Stop still records a usable status ----
+    t_fresh = [user_msg("刚开工的任务"), turn_start(), tool_call()]
+    run_main(t_fresh, "", sid="goal3", event="PreCompact", extra={"trigger": "auto"},
+             keep_state=True)
+    cp_d = json.load(open(os.path.join(wd.CHECKPOINT_DIR, "goal3.json")))
+    check("precompact before first Stop still has a status",
+          cp_d.get("status"), wd.RUNNING)
+    injected = run_main(t_fresh, "", sid="goal3", event="SessionStart",
+                        extra={"source": "compact"}, raw=True)
+    check("resume text never says 'None'", "None" in injected, False)
+
+    wd.STATE_DIR, wd.EVENTS_FILE, wd.METRICS_FILE, wd.CHECKPOINT_DIR = _saved6
+    _sh.rmtree(_tmp6, ignore_errors=True)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if not os.path.exists(ENABLED):
