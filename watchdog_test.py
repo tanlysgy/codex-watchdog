@@ -687,6 +687,11 @@ def main():
     _real_home = os.environ.get("HOME")
     _fake_home = _tf2.mkdtemp(prefix="wd-home-")
     os.environ["HOME"] = _fake_home
+    # An installed copy keeps its global enable marker next to watchdog.py
+    # instead of under HOME, so redirect that lookup too when this suite is
+    # run from ~/.codex rather than a source checkout.
+    _real_here = wd._HERE
+    wd._HERE = _fake_home
     try:
         for ev_name, extra, out_kind in (("Stop", {"last_assistant_message": "继续"}, "json"),
                                          ("PreCompact", {"trigger": "auto"}, "raw"),
@@ -727,6 +732,7 @@ def main():
             else:
                 os.environ["CODEX_WATCHDOG"] = _prev_off
     finally:
+        wd._HERE = _real_here
         if _real_home is not None:
             os.environ["HOME"] = _real_home
         _sh.rmtree(_fake_home, ignore_errors=True)
