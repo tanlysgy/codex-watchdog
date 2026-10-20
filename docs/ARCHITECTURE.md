@@ -8,7 +8,7 @@
 |---|---|---|
 | `Stop` | 回合结束,判断继续还是停 | `{"decision":"block","reason":...}` 续推 / `{"continue":true}` 停 |
 | `PreCompact` | 上下文即将被压缩,落检查点 | 无(不需要决策) |
-| `SessionStart` | 压缩后重新会话,注入恢复上下文 | 纯文本 stdout(上下文类事件的官方载体) |
+| `SessionStart` | 确保限流恢复器运行;压缩后注入恢复上下文 | 纯文本 stdout(上下文类事件的官方载体) |
 
 ```
 turn ends ──> Stop ──> continue? ──> yes ──> block, keep going
@@ -19,6 +19,32 @@ context fills ──> PreCompact ──> checkpoint(goal + next step)
                                         │
                              SessionStart(source=compact) ──> inject context ──> resume
 ```
+
+## 请求限流恢复(独立于 Stop)
+
+`watchdog_recovery.py` 是独立进程,由安装器或启用会话的 SessionStart 异步启动。
+它通过 `watchdog_rpc.py` 连接本机 daemon 的 Unix WebSocket,不重启 Codex、不新建会话。
+每个 socket 对应一个全生命周期文件锁;hook 启动进程前获取锁,通过继承 fd 交接,
+避免并发会话重复启动。stdout/stderr/stdin 与 hook 完全脱离。
+
+`thread/loaded/list` → `thread/read` → `thread/turns/list(limit=1, itemsView=notLoaded)`
+读取结构化状态,不会把终端引用、工具输出或正常总结中的“限流”当成故障。
+只有可直接输入的主会话最后一回合 `failed` 且为瞬时限流才安排退避。原生仍在执行/
+重试、主动取消、配额不足、认证失败都不触发。首次观测的历史失败只登记不恢复。
+
+退避默认 30 秒起、指数增加、常规上限 300 秒,错误文本中的 retry-after 下限优先,
+连续最多 6 次。恢复回合 ID 关联预算,真实新回合重置预算;重复失败不会被 Stop 的
+“重复最终消息/静默回合”规则过早终止。计时器和已提交标记持久化在
+`STATE_DIR/recovery/<socket-hash>.json`,发送前落盘失败就拒绝提交。
+
+到期后重新读取会话和最后一回合,检查 `thread/queue/list` 无用户排队输入,
+再以 `turn/start` 发送带 `[watchdog]` 标记的续接提示。只传 threadId 和 input,
+沿用原会话模型、权限与工作目录。`turn/start` 不支持条件启动,核对与提交之间有极短竞争
+窗口;这不是一个原子 compare-and-start。收到不确定的 RPC 结果时宁可停止自动恢复,
+也不重复提交同一回合。
+
+控制连接断开时延迟重连;不加载未运行的会话,也不退化成 `codex exec resume`。
+旧宿主缺少这些接口时跳过,正常 hooks 保持可用。`--disable` 标记可停止已运行的恢复器。
 
 ## 决策顺序(优先级从高到低)
 
@@ -170,9 +196,12 @@ context fills ──> PreCompact ──> checkpoint(goal + next step)
 
 ### 有界性(Bounded state)
 
-- `events.jsonl` 超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)→ 轮转为 `events.jsonl.1`。
+- `events.jsonl` 超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)→保留当前文件与
+  `events.jsonl.1`、`events.jsonl.2` 两级轮转文件;同一会话的指标快照保留轮转前的累计值。
 - 会话状态与检查点空闲超过 `CODEX_WATCHDOG_TTL`(默认 7 天)→ 清理(每小时最多一次)。
-- 状态文件用临时文件 + `os.replace` 原子写入,崩溃不会留下半个状态文件而丢掉预算。
+- 状态、检查点和指标用同目录临时文件 + `os.replace` 原子写入;同一会话用 `flock`
+  串行化状态转换;最多 64 个分片锁会让少量不同会话短暂共用锁,避免按会话永久增长。
+  事件流和全局指标分别加锁。POSIX 下私有状态目录使用 `0700`,生成的数据与日志文件使用 `0600`。
 
 ### 宿主上限(Host block cap)
 

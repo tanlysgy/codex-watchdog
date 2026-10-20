@@ -50,7 +50,8 @@ cd codex-watchdog
 bash install.sh
 ```
 
-That registers a `Stop` hook in `~/.codex/hooks.json` and creates the global
+That registers `Stop`, `PreCompact`, and `SessionStart` hooks in
+`~/.codex/hooks.json` and creates the global
 enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 `/hooks` inside Codex CLI and **trust** the `watchdog.py` hook entry.
 
@@ -59,11 +60,16 @@ enable marker `~/.codex/watchdog.enabled` (every session is watched). Then run
 > no need for a per-session "wake word" anymore (the transcript wake-word scan
 > remains as a fallback for sessions started without the marker).
 
+The installer accepts both `bash install.sh --agent claude` and
+`bash install.sh --agent=claude`. `CODEX_HOME` and `CLAUDE_HOME` are supported;
+the generated hook command uses the resolved absolute script path.
+
 ### Verify
 
 ```bash
-python3 watchdog_test.py    # 112 regression tests
-python3 adapters_test.py    # 46 adapter tests
+python3 watchdog_test.py    # 121 regression tests
+python3 adapters_test.py    # 48 adapter tests
+python3 -m unittest watchdog_recovery_test  # offline recovery + WebSocket tests
 tail /tmp/codex-watchdog.log  # if you see "continue #1" it's working
 ```
 
@@ -136,10 +142,13 @@ continue rounds, stop-reason distribution, quiet-turn hits, recovery counters
 (`stalled_recovered`, `completed_then_continued`, `blocked_then_continued`), and
 run-lifecycle counts (`compactions`, `resumes`, `host_continuations`).
 
-**Bounded by design** — the event log rotates to `events.jsonl.1` once it exceeds
-`CODEX_WATCHDOG_EVENTS_MAX`, and session state plus checkpoints idle for longer
-than `CODEX_WATCHDOG_TTL` are cleaned up (at most once an hour). State files are
-written atomically, so a crash can't corrupt the burst budget.
+**Bounded by design** — the event log rotates through `events.jsonl.1` and
+`events.jsonl.2` once it exceeds `CODEX_WATCHDOG_EVENTS_MAX`, and session state
+plus checkpoints idle for longer than `CODEX_WATCHDOG_TTL` are cleaned up (at
+most once an hour). State and metrics files are written atomically, and hook
+state transitions are serialized through a fixed pool of 64 lock files.
+On POSIX, state directories are private and generated state, event, and log
+files are readable only by the current user.
 
 ### Resume engine: surviving context compaction
 
@@ -208,6 +217,50 @@ transcript parsing lives in `adapters/` and is selected via `CODEX_WATCHDOG_ADAP
 The core logic (`watchdog.py`) is pure Python, zero dependencies, and reads/produces JSON on
 stdin/stdout — any agent with a Stop hook and a small adapter can reuse it.
 
+### Automatic recovery from provider rate limits
+
+An API error such as `rate limit exceeded: Requests have exceeded the throughput
+limit on your Provisioned-Managed deployment` can end a turn without a `Stop`
+hook. `watchdog_recovery.py` handles this outside the hook, through the running
+local Codex daemon's Unix WebSocket control socket. It uses only Python's standard
+library; the existing hook behavior is unchanged.
+
+Re-run `bash install.sh` to install and start it. Future `SessionStart` hooks also
+ensure that one supervisor is running per control socket. It polls loaded, enabled
+root threads every five seconds and retries only a **failed, rate-limited turn**.
+The default cooldowns are **30, 60, 120, 240, 300, 300 seconds**, with at most six
+consecutive recovery attempts. Numeric `Retry-After` / `retry in` hints in the
+error text extend that delay, even beyond the normal ceiling.
+
+Before submitting `[watchdog]` continuation input to the same thread, it checks
+the latest turn and pending user queue again. Completed/interrupted turns, quota
+exhaustion, authentication errors, child agents, and historical failures present
+when monitoring first starts are skipped. The continuation asks Codex to inspect
+running commands and saved output before repeating any work. Recovery does not
+override the model, working directory, or permissions.
+
+```bash
+python3 ~/.codex/watchdog_recovery.py --disable  # also stops the running supervisor
+python3 ~/.codex/watchdog_recovery.py --enable
+tail /tmp/codex-watchdog.log  # recovery scheduled / sent / cancelled / exhausted
+```
+
+Optional environment settings: `CODEX_WATCHDOG_RECOVERY=0` disables startup;
+`CODEX_WATCHDOG_RETRY_BASE=30`, `CODEX_WATCHDOG_RETRY_CEILING=300`, and
+`CODEX_WATCHDOG_RETRY_MAX=6` configure a newly started supervisor.
+`CODEX_WATCHDOG_SOCKET` selects a custom local control socket. Persistent retry
+state is stored privately under `/tmp/codex-watchdog/recovery/` (or the configured
+state directory). A failed state write prevents submission; an uncertain RPC
+result is not retried for the same failed turn.
+
+This requires a Codex daemon exposing `thread/loaded/list`, `thread/read`,
+`thread/turns/list`, `thread/queue/list`, and `turn/start` (verified with local
+Codex 0.159.3). Older versions, remote servers, `--no-daemon`, and Claude Code
+retain hook-only behavior. A turn that remains active indefinitely is not
+restarted. The final state check and `turn/start` are separate RPCs: input arriving
+in that brief interval can race with recovery because the API has no conditional
+start operation. See the [official app-server documentation](https://developers.openai.com/codex/app-server/).
+
 ### Comparison & known limitations
 
 Similar projects we found while evaluating this one:
@@ -217,11 +270,9 @@ Similar projects we found while evaluating this one:
 | [flowing-water1/codex-watchdog](https://github.com/flowing-water1/codex-watchdog) | Node.js proxy between the Codex TUI and `app-server` | Watches **outside** the Stop hook; recovers transient failures (429/502/503/504), context exhaustion, and usage limits — deeper than a hook can reach |
 | [kur114/codex-auto-continue-hook](https://github.com/kur114/codex-auto-continue-hook) | Stop hook + keyword matching | Same hook-based idea, but keyword matching is brittle; we use evidence-driven detection (tool activity, `任务完成`/`需要用户` protocol, quiet-turn + burst guards) |
 
-**Known limitation**: we run inside the Stop hook, so we can only act when a turn
-actually ends and triggers the hook. If a connection drops mid-response and the
-turn never completes cleanly (no `Stop` event), the watchdog cannot restart it —
-that class of failure needs an out-of-process supervisor like
-`flowing-water1/codex-watchdog`.
+**Known limitation**: the external supervisor currently recovers provider rate
+limits only. Other failures that do not trigger a `Stop` hook still require host
+recovery or manual intervention.
 
 ### License
 

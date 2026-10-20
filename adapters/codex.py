@@ -9,7 +9,7 @@
 import json
 import os
 import sys
-from .base import BaseAdapter, cached_rows
+from .base import BaseAdapter, cached_rows, tail_lines
 
 NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions")
 
@@ -27,15 +27,10 @@ class CodexAdapter(BaseAdapter):
     def _parse(path, n=600):
         if not path or not os.path.exists(path):
             return []
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = list(f)[-n:]
-        except OSError:
-            return []
         rows = []
-        for line in lines:
+        for line in tail_lines(path, n):
             try:
-                rows.append(json.loads(line))
+                rows.append(json.loads(line.decode("utf-8", "replace")))
             except ValueError:
                 continue
         return rows
@@ -79,6 +74,16 @@ class CodexAdapter(BaseAdapter):
             if text and not self.is_noise(text):
                 last = text
         return last
+
+    def last_user_prompt_identity(self, ev: dict):
+        last = None
+        count = 0
+        for o in self._rows(ev.get("transcript_path")):
+            text = self._user_text(o)
+            if text and not self.is_noise(text) and not self.is_watchdog_inject(text):
+                count += 1
+                last = text
+        return f"{count}\0{last}" if last is not None else None
 
     def first_user_prompt(self, ev: dict):
         for o in self._rows(ev.get("transcript_path")):

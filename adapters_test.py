@@ -113,6 +113,19 @@ p_fb = write_tmp([
 ])
 check("claude: stop hook feedback is noise", claude.last_user_prompt({"transcript_path": p_fb}), "Reply with exactly: watchdog-e2e-ok")
 
+# 7d. raw role/content rows are also accepted (some Claude exports omit the
+# outer type/message wrapper).
+p_raw = write_tmp([
+    {"role": "user", "content": "原始用户消息"},
+    {"role": "assistant", "content": [
+        {"type": "text", "text": "开始处理"},
+        {"type": "tool_use", "name": "Bash"},
+    ]},
+])
+check("claude: raw role user", claude.last_user_prompt({"transcript_path": p_raw}), "原始用户消息")
+check("claude: raw assistant tool activity",
+      claude.last_turn_tool_activity({"transcript_path": p_raw}), (1, {"Bash"}))
+
 # 8. claude: JSON array transcript
 p6 = tempfile.mktemp(suffix=".json")
 with open(p6, "w") as f:
@@ -232,7 +245,7 @@ CodexAdapter._parse = staticmethod(_real)
 check("three questions, one parse", _calls["n"], 1)
 _ROW_CACHE.clear()
 
-for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb, _empty, p_cache,
+for p in (p1, p2, p3, p4, p5, p6, p7, p8, p_aux, p_fb, p_raw, _empty, p_cache,
           p_first, p_cl_first):
     try:
         os.remove(p)

@@ -11,6 +11,9 @@ import os
 import sys
 import tempfile
 
+# Regression tests must never start a supervisor against the user's daemon.
+os.environ["CODEX_WATCHDOG_RECOVERY"] = "0"
+
 # Prefer the watchdog.py next to this test file (repo checkout),
 # fall back to the installed copy in ~/.codex.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -252,6 +255,40 @@ def main():
                        "quiet_turns": 0, "activated": True})
     check("english protocol Need User -> continue(stop)", r.get("continue"), True)
 
+    # ---- Claude filters its own feedback from last_user_prompt; do not reset
+    # the burst budget on every continuation as though it were a new prompt.
+    from adapters.base import _ROW_CACHE
+    old_adapter = wd.ADAPTER
+    claude_tp = tempfile.mktemp(suffix=".jsonl")
+    claude_rows = [
+        {"type": "user", "message": {"role": "user", "content": "继续重构"}},
+        {"type": "user", "message": {"role": "user", "content":
+            "Stop hook feedback:\n[watchdog] keep working"}},
+    ]
+    with open(claude_tp, "w", encoding="utf-8") as f:
+        for row in claude_rows:
+            f.write(json.dumps(row) + "\n")
+    wd.ADAPTER = wd.load_adapter("claude")
+    claude_state = {"count": 0, "last_continue_at": None, "last_msg": None}
+    claude_ev = {"session_id": "claude-reset", "transcript_path": claude_tp}
+    _ROW_CACHE.clear()
+    check("claude prompt starts burst tracking",
+          wd.should_reset_burst(claude_state, claude_ev), True)
+    claude_state["count"] = 1
+    check("claude feedback does not reset burst",
+          wd.should_reset_burst(claude_state, claude_ev), False)
+    with open(claude_tp, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "user", "message": {"role": "user",
+                 "content": "继续重构"}}) + "\n")
+    _ROW_CACHE.pop(claude_tp, None)
+    check("new Claude prompt resets burst",
+          wd.should_reset_burst(claude_state, claude_ev), True)
+    wd.ADAPTER = old_adapter
+    try:
+        os.remove(claude_tp)
+    except OSError:
+        pass
+
     # ---- bilingual reason follows session language (Chinese vs English) ----
     r_zh = run_with_prompt("继续做 P7.5,中文会话", "还没做完,继续", sid="s18")
     r_en = run_with_prompt("continue with the task", "not done yet, keep going", sid="s19")
@@ -418,6 +455,35 @@ def main():
         finally:
             del os.environ[name]
         check(f"invalid {name}={bad!r} tolerated", got, "ok")
+
+    # ---- malformed hook payloads must still satisfy the JSON contract ----
+    for payload in ("not-json", "[]", "null", "7"):
+        old_in, old_out = sys.stdin, sys.stdout
+        sys.stdin = io.StringIO(payload)
+        out = io.StringIO()
+        sys.stdout = out
+        try:
+            wd.main()
+        finally:
+            sys.stdin, sys.stdout = old_in, old_out
+        check(f"malformed/top-level hook payload {payload!r}",
+              json.loads(out.getvalue()).get("continue"), True)
+
+    # ---- host-provided session ids cannot escape the state directory ----
+    path_sid = "../outside/session"
+    original_state_dir = wd.STATE_DIR
+    path_state_dir = tempfile.mkdtemp(prefix="wd-path-")
+    wd.STATE_DIR = path_state_dir
+    wd.save_state(path_sid, {"count": 7})
+    path_token = wd._session_file_token(path_sid)
+    check("unsafe session id stays inside state dir",
+          os.path.dirname(os.path.realpath(os.path.join(
+              wd.STATE_DIR, f"{path_token}.json"))),
+          os.path.realpath(wd.STATE_DIR))
+    check("unsafe session state round-trips", wd.load_state(path_sid).get("count"), 7)
+    os.remove(os.path.join(path_state_dir, f"{path_token}.json"))
+    os.rmdir(path_state_dir)
+    wd.STATE_DIR = original_state_dir
 
     # ---- host block cap bounds the effective burst budget ----
     default_cap = wd.HOST_BLOCK_CAP

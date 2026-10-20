@@ -6,8 +6,29 @@ re-parsing the file for each question is pure waste, so adapters share one
 per-process row cache via `cached_rows`.
 """
 
+import os
+
 # path -> parsed rows, scoped to this short-lived process.
 _ROW_CACHE = {}
+
+
+def tail_lines(path, n=600, chunk_size=65536):
+    """Read at most the last n physical lines without loading the whole file."""
+    if not path or n <= 0:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            position = f.tell()
+            data = b""
+            while position > 0 and data.count(b"\n") <= n:
+                size = min(chunk_size, position)
+                position -= size
+                f.seek(position)
+                data = f.read(size) + data
+    except OSError:
+        return []
+    return data.splitlines()[-n:]
 
 
 def cached_rows(fetch, path, n=600):
@@ -37,6 +58,10 @@ class BaseAdapter:
     def last_user_prompt(self, ev: dict):
         """Return the text of the most recent real user message, or None."""
         raise NotImplementedError
+
+    def last_user_prompt_identity(self, ev: dict):
+        """Return a stable identity that changes for a new user message."""
+        return self.last_user_prompt(ev)
 
     def first_user_prompt(self, ev: dict):
         """Return the text of the session's first real user message, or None.

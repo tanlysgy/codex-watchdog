@@ -55,7 +55,8 @@ cd codex-watchdog
 bash install.sh
 ```
 
-脚本会注册 `~/.codex/hooks.json` 的 `Stop` hook,并创建全局启用标记
+脚本会在 `~/.codex/hooks.json` 注册 `Stop`、`PreCompact`、`SessionStart` hooks,
+并创建全局启用标记
 `~/.codex/watchdog.enabled`(所有会话都启用)。然后在 Codex CLI 里运行
 `/hooks`,给 `watchdog.py` 这条点"信任"。
 
@@ -63,11 +64,16 @@ bash install.sh
 > 包括老会话,不再需要会话里出现"看门狗"等唤醒词(转录唤醒词扫描仍保留,
 > 作为无标记会话的兜底)。
 
+安装 Claude Code 可使用 `bash install.sh --agent claude` 或
+`bash install.sh --agent=claude`;设置 `CODEX_HOME` / `CLAUDE_HOME` 时生成的
+hook 命令会使用实际解析后的脚本绝对路径。
+
 ### 验证
 
 ```bash
-python3 watchdog_test.py    # 回归测试(112 项)
-python3 adapters_test.py    # adapter 测试(46 项)
+python3 watchdog_test.py    # 回归测试(121 项)
+python3 adapters_test.py    # adapter 测试(48 项)
+python3 -m unittest watchdog_recovery_test  # 离线限流恢复与 WebSocket 测试
 tail /tmp/codex-watchdog.log  # 看到 continue #1 即生效
 ```
 
@@ -109,9 +115,12 @@ bash install.sh --uninstall
 - 检查点:`/tmp/codex-watchdog/checkpoints/<session_id>.json`
 - 指标:`/tmp/codex-watchdog/metrics.json`(按会话 + 总计,增量聚合)
 
-运行时有界,不会无限增长:事件流超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)会轮转;
-空闲超过 `CODEX_WATCHDOG_TTL`(默认 7 天)的会话状态与检查点会被清理;状态文件原子写入,
-崩溃不会破坏续推预算。环境变量写错(非法值、空串、越界)只会退回默认值,不会让 hook 崩溃。
+运行时有界,不会无限增长:事件流超过 `CODEX_WATCHDOG_EVENTS_MAX`(默认 2 MB)会在
+`events.jsonl.1`、`events.jsonl.2`之间轮转;空闲超过 `CODEX_WATCHDOG_TTL`(默认 7 天)
+的会话状态与检查点会被清理;状态、检查点和指标原子写入,同一会话的 hook 状态转换串行化。
+状态转换使用固定 64 个分片锁,避免每个会话永久遗留一个锁文件。
+POSIX 下状态目录为私有目录,生成的状态、事件与日志文件仅当前用户可读。
+环境变量写错(非法值、空串、越界)只会退回默认值,不会让 hook 崩溃。
 
 ### 上下文压缩后自动续接(Resume Engine)
 
@@ -151,6 +160,41 @@ Continue from the next step instead of restarting. ...
 (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),所以在其上默认取 `min(60, 8)`;Codex 没有这个上限,
 完全依赖 `CODEX_WATCHDOG_MAX` 自我约束。详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+### 请求限流后自动恢复
+
+`rate limit exceeded: Requests have exceeded the throughput limit on your
+Provisioned-Managed deployment` 这类错误可能没有触发 `Stop` hook。
+新增的 `watchdog_recovery.py` 在 hook 外通过本机 Codex daemon 的 Unix WebSocket
+控制接口监控会话,仍然只使用 Python 标准库。
+
+重新运行 `bash install.sh` 即安装并启动;后续 `SessionStart` 也会确保每个控制 socket
+只有一个恢复器。每 5 秒检查已加载、已启用、可直接输入的主会话,只恢复**已失败且明确
+限流**的回合。默认依次等待 **30、60、120、240、300、300 秒**,连续最多尝试 6 次。
+错误文本中的数字 `Retry-After` / `retry in` 提示会延长等待,不会被 300 秒上限截短。
+
+发送前会重新核对最后一个回合与用户消息队列;已经继续、完成、取消或有排队输入时取消重试。
+余额/额度耗尽、认证失败、子 agent 和首次监控时已经存在的历史失败不会自动恢复。
+续接提示会要求先检查仍在运行的命令和已保存输出,避免重做操作;模型、目录和权限沿用原会话。
+
+```bash
+python3 ~/.codex/watchdog_recovery.py --disable  # 正在运行的恢复器也会停止
+python3 ~/.codex/watchdog_recovery.py --enable
+tail /tmp/codex-watchdog.log  # recovery scheduled / sent / cancelled / exhausted
+```
+
+可选环境变量:`CODEX_WATCHDOG_RECOVERY=0` 禁止启动;
+`CODEX_WATCHDOG_RETRY_BASE=30`、`CODEX_WATCHDOG_RETRY_CEILING=300`、
+`CODEX_WATCHDOG_RETRY_MAX=6` 调整新启动进程的退避与次数;
+`CODEX_WATCHDOG_SOCKET` 指定其他本地控制 socket。重试状态保存在私有目录
+`/tmp/codex-watchdog/recovery/`(或自定义状态目录)。状态写入失败时不提交;
+RPC 结果不确定时不会对同一个失败回合重复提交。
+
+要求 daemon 支持 `thread/loaded/list`、`thread/read`、`thread/turns/list`、
+`thread/queue/list`、`turn/start`(已用本机 Codex 0.159.3 验证接口)。旧版本、远程服务、
+`--no-daemon` 和 Claude Code 仍仅使用 hooks。一直保持 active 的挂起回合不强制重启。
+最终核对与 `turn/start` 是两个 RPC;接口没有条件启动操作,两者间极短时间内的新输入仍可能
+与恢复竞争。接口参考 [OpenAI 官方 app-server 文档](https://developers.openai.com/codex/app-server/)。
+
 ### 同类项目对比与已知局限
 
 调研时找到的两个最像的项目:
@@ -160,9 +204,8 @@ Continue from the next step instead of restarting. ...
 | [flowing-water1/codex-watchdog](https://github.com/flowing-water1/codex-watchdog) | Node.js 代理,插在 Codex TUI 与 `app-server` 之间 | 在 Stop hook **之外**主动监控,能恢复瞬时故障(429/502/503/504)、上下文耗尽、额度限制——比 hook 能触及的更深 |
 | [kur114/codex-auto-continue-hook](https://github.com/kur114/codex-auto-continue-hook) | Stop hook + 关键词匹配 | 思路相同,但关键词硬匹配脆弱;我们用证据驱动(工具调用 + `任务完成`/`需要用户` 协议 + 静默/预算兜底)更抗误判 |
 
-**已知局限**:我们运行在 Stop hook 内部,只能在一回合正常结束并触发 hook 时介入。
-如果连接中断但回合没有正常收尾(没有触发 Stop 事件),看门狗无法自己重启它——这类
-故障需要进程外的监督器(如 `flowing-water1/codex-watchdog` 的方案)。
+**已知局限**:外部恢复器目前只自动处理请求限流;其他未触发 `Stop` hook 的故障,
+仍需要宿主恢复或人工介入。
 
 ### License
 

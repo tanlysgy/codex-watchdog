@@ -20,7 +20,7 @@ Privacy note: we only read the LAST N lines and never write anything there.
 import json
 import os
 import sys
-from .base import BaseAdapter, cached_rows
+from .base import BaseAdapter, cached_rows, tail_lines
 
 NOISE_PREFIXES = ("<environment_context", "<turn_aborted", "# AGENTS.md instructions", "Stop hook feedback:")
 
@@ -96,22 +96,23 @@ class ClaudeAdapter(BaseAdapter):
         if not path or not os.path.exists(path):
             return []
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                raw = f.read()
+            with open(path, "rb") as f:
+                first = f.read(4096).lstrip()
         except OSError:
             return []
-        if raw.lstrip().startswith("["):
+        if first.startswith(b"["):
             # JSON array transcript
             try:
-                arr = json.loads(raw)
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    arr = json.load(f)
                 return arr[-n:] if isinstance(arr, list) else []
-            except ValueError:
+            except (OSError, ValueError):
                 pass
         # JSONL fallback
         rows = []
-        for line in raw.splitlines()[-n:]:
+        for line in tail_lines(path, n):
             try:
-                rows.append(json.loads(line))
+                rows.append(json.loads(line.decode("utf-8", "replace")))
             except ValueError:
                 continue
         return rows
@@ -128,6 +129,9 @@ class ClaudeAdapter(BaseAdapter):
         t = o.get("type", "")
         if t in ("user", "assistant", "tool_use", "tool_result"):
             return t
+        r = o.get("role", "")
+        if r in ("user", "assistant", "tool_use", "tool_result"):
+            return r
         # unwrap {"message": {"role": ...}} or {"message": {"content": [...]}}
         m = o.get("message")
         if isinstance(m, dict):
@@ -168,6 +172,18 @@ class ClaudeAdapter(BaseAdapter):
                 last = text
         return last
 
+    def last_user_prompt_identity(self, ev: dict):
+        last = None
+        count = 0
+        for o in self._rows(ev.get("transcript_path")):
+            role = self._entry_role(o)
+            text = self._entry_text(o)
+            if (role == "user" and text and not self.is_noise(text)
+                    and not self.is_watchdog_inject(text)):
+                count += 1
+                last = text
+        return f"{count}\0{last}" if last is not None else None
+
     def first_user_prompt(self, ev: dict):
         for o in self._rows(ev.get("transcript_path")):
             role = self._entry_role(o)
@@ -197,18 +213,19 @@ class ClaudeAdapter(BaseAdapter):
         n = 0
         names = set()
         for o in rows[-80:]:
-            t = o.get("type")
-            if t == "tool_use":
+            role = self._entry_role(o)
+            if role == "tool_use":
                 n += 1
                 nm = o.get("name") or ""
                 if nm:
                     names.add(nm)
-            elif t == "tool_result":
+            elif role == "tool_result":
                 n += 1
-            elif t == "assistant":
+            elif role == "assistant":
                 # nested tool calls in content blocks
-                m = o.get("message") or {}
-                content = m.get("content") if isinstance(m, dict) else o.get("content")
+                m = o.get("message")
+                content = (m.get("content") if isinstance(m, dict)
+                           else o.get("content"))
                 in_n, in_names = _content_tool_uses(content)
                 n += in_n
                 names |= in_names
